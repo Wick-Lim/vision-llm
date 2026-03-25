@@ -1,4 +1,4 @@
-"""Training loop for Vision LLM."""
+"""Training loop for vector path diffusion model."""
 
 import argparse
 import time
@@ -6,108 +6,163 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from pytorch_msssim import ssim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
-from .dataset import EchoDataset, UppercaseDataset
-from .model import VisionLLM
-
-
-def combined_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.7) -> torch.Tensor:
-    """Weighted combination of MSE and (1 - SSIM) loss."""
-    mse = nn.functional.mse_loss(pred, target)
-    ssim_val = ssim(pred, target, data_range=1.0, size_average=True)
-    return alpha * mse + (1 - alpha) * (1 - ssim_val)
+from .dataset import GlyphEchoDataset
+from .diffusion import NoiseScheduler, UNet1d
+from .encoder import PathEncoder
+from .vectorizer import DEFAULT_MAX_LEN
 
 
 def train(
-    task: str = "echo",
-    epochs: int = 50,
-    batch_size: int = 64,
+    font_path: str | None = None,
+    max_len: int = DEFAULT_MAX_LEN,
+    epochs: int = 100,
+    batch_size: int = 32,
     lr: float = 1e-3,
-    dataset_size: int = 10000,
     device: str | None = None,
     save_dir: str = "checkpoints",
+    num_timesteps: int = 1000,
+    cond_dim: int = 256,
+    model_dim: int = 128,
+    max_chars: int | None = None,
 ):
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Device: {device} | Task: {task} | Epochs: {epochs}")
+    print(f"Device: {device}")
 
     # Dataset
-    ds_cls = {"echo": EchoDataset, "uppercase": UppercaseDataset}[task]
-    train_ds = ds_cls(size=dataset_size, seed=42)
-    val_ds = ds_cls(size=dataset_size // 10, seed=99)
+    dataset = GlyphEchoDataset(font_path=font_path, max_len=max_len, max_chars=max_chars)
+    val_size = max(1, len(dataset) // 10)
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_dl = DataLoader(val_ds, batch_size=batch_size, num_workers=0)
 
-    # Model
-    model = VisionLLM(latent_dim=256, think_depth=3).to(device)
-    print(f"Parameters: {model.param_count():,}")
+    # Models
+    encoder = PathEncoder(cond_dim=cond_dim).to(device)
+    unet = UNet1d(cond_dim=cond_dim, model_dim=model_dim).to(device)
+    scheduler = NoiseScheduler(num_timesteps=num_timesteps)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    total_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in unet.parameters())
+    print(f"Parameters: encoder={sum(p.numel() for p in encoder.parameters()):,} "
+          f"unet={sum(p.numel() for p in unet.parameters()):,} total={total_params:,}")
+
+    # Optimizer (joint for encoder + unet)
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) + list(unet.parameters()),
+        lr=lr,
+    )
+    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     save_path = Path(save_dir)
     save_path.mkdir(exist_ok=True)
-
     best_val_loss = float("inf")
+
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        # Train
-        model.train()
+        # --- Train ---
+        encoder.train()
+        unet.train()
         train_loss = 0.0
+        n_train = 0
+
         for src, tgt in train_dl:
             src, tgt = src.to(device), tgt.to(device)
-            pred = model(src)
-            loss = combined_loss(pred, tgt)
+            B = src.size(0)
+
+            # Encode condition
+            cond = encoder(src)
+
+            # Sample random timesteps
+            t = torch.randint(0, num_timesteps, (B,), device=device)
+
+            # Forward diffusion on target
+            noise = torch.randn_like(tgt)
+            x_t = scheduler.add_noise(tgt, noise, t)
+
+            # Predict noise
+            pred_noise = unet(x_t, t, cond)
+
+            loss = nn.functional.mse_loss(pred_noise, noise)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * src.size(0)
-        train_loss /= len(train_ds)
 
-        # Validate
-        model.eval()
+            train_loss += loss.item() * B
+            n_train += B
+
+        train_loss /= n_train
+
+        # --- Validate ---
+        encoder.eval()
+        unet.eval()
         val_loss = 0.0
+        n_val = 0
+
         with torch.no_grad():
             for src, tgt in val_dl:
                 src, tgt = src.to(device), tgt.to(device)
-                pred = model(src)
-                val_loss += combined_loss(pred, tgt).item() * src.size(0)
-        val_loss /= len(val_ds)
+                B = src.size(0)
 
-        scheduler.step()
+                cond = encoder(src)
+                t = torch.randint(0, num_timesteps, (B,), device=device)
+                noise = torch.randn_like(tgt)
+                x_t = scheduler.add_noise(tgt, noise, t)
+                pred_noise = unet(x_t, t, cond)
+
+                val_loss += nn.functional.mse_loss(pred_noise, noise).item() * B
+                n_val += B
+
+        val_loss /= n_val
+        scheduler_lr.step()
         elapsed = time.time() - t0
-        print(f"[{epoch:3d}/{epochs}] train={train_loss:.4f} val={val_loss:.4f} ({elapsed:.1f}s)")
+
+        print(f"[{epoch:3d}/{epochs}] train={train_loss:.6f} val={val_loss:.6f} ({elapsed:.1f}s)")
 
         # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path / f"best_{task}.pt")
+            torch.save({
+                "encoder": encoder.state_dict(),
+                "unet": unet.state_dict(),
+                "epoch": epoch,
+                "val_loss": val_loss,
+            }, save_path / "best.pt")
 
-    torch.save(model.state_dict(), save_path / f"last_{task}.pt")
-    print(f"Done. Best val loss: {best_val_loss:.4f}")
-    return model
+    torch.save({
+        "encoder": encoder.state_dict(),
+        "unet": unet.state_dict(),
+        "epoch": epochs,
+        "val_loss": val_loss,
+    }, save_path / "last.pt")
+    print(f"Done. Best val loss: {best_val_loss:.6f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Vision LLM")
-    parser.add_argument("--task", choices=["echo", "uppercase"], default="echo")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser = argparse.ArgumentParser(description="Train Vector Path Diffusion Model")
+    parser.add_argument("--font", type=str, default=None, help="Path to TTF/OTF font file")
+    parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--dataset-size", type=int, default=10000)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--timesteps", type=int, default=1000)
+    parser.add_argument("--max-chars", type=int, default=None, help="Limit number of glyphs (for fast iteration)")
     args = parser.parse_args()
+
     train(
-        task=args.task,
+        font_path=args.font,
+        max_len=args.max_len,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        dataset_size=args.dataset_size,
         device=args.device,
+        max_chars=args.max_chars,
+        num_timesteps=args.timesteps,
     )
 
 

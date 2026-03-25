@@ -1,93 +1,93 @@
-"""Dataset generator for Vision LLM training."""
+"""Dataset for vector path diffusion training.
 
-import random
-import string
+Phase 1: Echo task — reproduce the same glyph's vector paths.
+Uses Korean Hangul syllables (가~힣) + ASCII printable characters.
+"""
 
 import torch
+from fontTools.ttLib import TTFont
 from torch.utils.data import Dataset
 
-from .renderer import image_to_tensor, render_text
+from .vectorizer import (
+    DEFAULT_MAX_LEN,
+    extract_glyph,
+    get_glyph_bounds,
+    load_font,
+    paths_to_tensor,
+)
+
+# Hangul syllable range
+HANGUL_START = 0xAC00
+HANGUL_END = 0xD7A3  # 11,172 syllables
+
+# ASCII printable range
+ASCII_START = 0x21
+ASCII_END = 0x7E  # 94 characters
 
 
-# Word pool for generating random text
-WORDS = [
-    "hello", "world", "python", "torch", "vision", "model", "train",
-    "learn", "data", "text", "image", "pixel", "font", "read", "write",
-    "code", "deep", "neural", "layer", "batch", "loss", "adam", "grad",
-    "test", "demo", "echo", "open", "save", "load", "run", "fast",
-    "slow", "big", "small", "red", "blue", "green", "cat", "dog", "sun",
-]
+def _chars_in_font(font: TTFont, chars: list[str]) -> list[str]:
+    """Filter characters that exist in the font's cmap."""
+    cmap = font.getBestCmap()
+    return [c for c in chars if ord(c) in cmap]
 
 
-def random_text(min_chars: int = 3, max_chars: int = 16) -> str:
-    """Generate a random word or short phrase."""
-    mode = random.random()
-    if mode < 0.4:
-        # Single word from pool
-        return random.choice(WORDS)
-    elif mode < 0.7:
-        # Two words
-        return f"{random.choice(WORDS)} {random.choice(WORDS)}"
-    else:
-        # Random letters
-        length = random.randint(min_chars, max_chars)
-        return "".join(random.choices(string.ascii_lowercase, k=length))
+class GlyphEchoDataset(Dataset):
+    """Echo task: input = target = same glyph's vector path tensor.
 
-
-class EchoDataset(Dataset):
-    """Echo task: model must reproduce the input image exactly.
-
-    This is the simplest possible task — identity mapping.
-    Proves the encoder-decoder pipeline works before adding transformations.
+    Validates that the diffusion model can learn to generate
+    vector paths from conditioned noise.
     """
 
-    def __init__(self, size: int = 10000, seed: int = 42):
-        self.size = size
-        self.rng = random.Random(seed)
-        # Pre-generate texts for reproducibility
-        self.texts = [self._random_text() for _ in range(size)]
+    def __init__(
+        self,
+        font_path: str | None = None,
+        max_len: int = DEFAULT_MAX_LEN,
+        hangul: bool = True,
+        ascii_chars: bool = True,
+        max_chars: int | None = None,
+    ):
+        self.font = load_font(font_path)
+        self.max_len = max_len
 
-    def _random_text(self) -> str:
-        mode = self.rng.random()
-        if mode < 0.4:
-            return self.rng.choice(WORDS)
-        elif mode < 0.7:
-            return f"{self.rng.choice(WORDS)} {self.rng.choice(WORDS)}"
-        else:
-            length = self.rng.randint(3, 16)
-            return "".join(self.rng.choices(string.ascii_lowercase, k=length))
+        # Collect available characters
+        chars = []
+        if hangul:
+            chars.extend(chr(cp) for cp in range(HANGUL_START, HANGUL_END + 1))
+        if ascii_chars:
+            chars.extend(chr(cp) for cp in range(ASCII_START, ASCII_END + 1))
+
+        # Limit dataset size for fast iteration
+        if max_chars is not None and len(chars) > max_chars:
+            import random
+            random.Random(42).shuffle(chars)
+            chars = chars[:max_chars]
+
+        self.chars = _chars_in_font(self.font, chars)
+        print(f"GlyphEchoDataset: {len(self.chars)} glyphs available")
+
+        # Pre-extract all tensors for speed
+        self.tensors: list[torch.Tensor] = []
+        skipped = 0
+        for char in self.chars:
+            try:
+                paths = extract_glyph(self.font, char)
+                bounds = get_glyph_bounds(self.font, char)
+                tensor = paths_to_tensor(paths, max_len=max_len, bounds=bounds)
+                # Skip empty glyphs
+                if tensor.abs().sum() > 0:
+                    self.tensors.append(tensor)
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+        if skipped:
+            print(f"  Skipped {skipped} glyphs (empty or error)")
+        print(f"  Final dataset size: {len(self.tensors)}")
 
     def __len__(self) -> int:
-        return self.size
+        return len(self.tensors)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        text = self.texts[idx]
-        img = render_text(text)
-        t = image_to_tensor(img)
-        return t, t  # input = target for echo task
-
-
-class UppercaseDataset(Dataset):
-    """Uppercase task: input is lowercase text, target is UPPERCASE.
-
-    First real 'thinking' task — model must learn the visual
-    transformation from lowercase to uppercase letterforms.
-    """
-
-    def __init__(self, size: int = 10000, seed: int = 42):
-        self.size = size
-        self.rng = random.Random(seed)
-        self.texts = [self._random_text() for _ in range(size)]
-
-    def _random_text(self) -> str:
-        length = self.rng.randint(3, 12)
-        return "".join(self.rng.choices(string.ascii_lowercase, k=length))
-
-    def __len__(self) -> int:
-        return self.size
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        text = self.texts[idx]
-        src = image_to_tensor(render_text(text))
-        tgt = image_to_tensor(render_text(text.upper()))
-        return src, tgt
+        t = self.tensors[idx]
+        return t, t  # echo: input = target

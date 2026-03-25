@@ -1,14 +1,14 @@
 [project]
 name = "vision-llm"
-version = "0.1.0"
-description = "Tokenizer-free LLM that processes text as rendered images"
+version = "0.2.0"
+description = "Vector path-based visual language model with diffusion"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
-    "torchvision>=0.15",
+    "fonttools>=4.0",
     "Pillow>=10.0",
     "pytesseract>=0.3",
-    "pytorch-msssim>=1.0",
+    "numpy>=1.24,<2",
 ]
 
 [project.optional-dependencies]
