@@ -1,0 +1,15 @@
+[project]
+name = "vision-llm"
+version = "0.1.0"
+description = "Tokenizer-free LLM that processes text as rendered images"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "Pillow>=10.0",
+    "pytesseract>=0.3",
+    "pytorch-msssim>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib"]
