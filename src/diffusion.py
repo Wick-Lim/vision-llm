@@ -35,8 +35,8 @@ class NoiseScheduler:
 
     def add_noise(self, x0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Forward diffusion: q(x_t | x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise."""
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].to(x0.device)
-        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].to(x0.device)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t.cpu()].to(x0.device)
+        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t.cpu()].to(x0.device)
 
         # Reshape for broadcasting: [B] → [B, 1, 1]
         while sqrt_alpha.dim() < x0.dim():
@@ -55,10 +55,8 @@ class NoiseScheduler:
         device: str = "cpu",
     ) -> torch.Tensor:
         """DDIM deterministic sampling (eta=0)."""
-        # Create sub-sequence of timesteps
-        step_size = self.num_timesteps // num_steps
-        timesteps = list(range(0, self.num_timesteps, step_size))
-        timesteps = list(reversed(timesteps))
+        # Create sub-sequence of timesteps: high → low
+        timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long).tolist()
 
         x = torch.randn(shape, device=device)
 
@@ -69,7 +67,7 @@ class NoiseScheduler:
             alpha_t = self.alphas_cumprod[t].to(device)
             # Predict x_0
             x0_pred = (x - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-            x0_pred = x0_pred.clamp(-1, 1)
+            x0_pred = x0_pred.clamp(-0.6, 0.6)
 
             if i < len(timesteps) - 1:
                 t_prev = timesteps[i + 1]
@@ -123,9 +121,9 @@ class TimeMLPEmbedding(nn.Module):
 
 
 class ConvBlock1d(nn.Module):
-    """Conv1d → GroupNorm → SiLU, with time embedding injection."""
+    """Conv1d → GroupNorm → SiLU, with time + condition embedding injection."""
 
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int):
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, cond_dim: int = 256):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(in_ch, out_ch, 3, padding=1),
@@ -136,10 +134,11 @@ class ConvBlock1d(nn.Module):
             nn.SiLU(),
         )
         self.time_proj = nn.Linear(time_dim, out_ch)
+        self.cond_proj = nn.Linear(cond_dim, out_ch)
         self.res_conv = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x) + self.time_proj(t_emb).unsqueeze(-1)
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv(x) + self.time_proj(t_emb).unsqueeze(-1) + self.cond_proj(cond_emb).unsqueeze(-1)
         return h + self.res_conv(x)
 
 
@@ -189,8 +188,7 @@ class UNet1d(nn.Module):
     Input:  noisy paths [B, max_len, path_dim]
     Output: predicted noise [B, max_len, path_dim]
 
-    Conditioning via concatenation: cond vector is expanded
-    to sequence length and concatenated with input.
+    Conditioning via additive injection at every ConvBlock.
     """
 
     def __init__(
@@ -207,29 +205,29 @@ class UNet1d(nn.Module):
         # Time embedding
         self.time_embed = TimeMLPEmbedding(time_dim)
 
-        # Input projection: path_dim + cond_dim → model_dim
-        self.input_proj = nn.Conv1d(path_dim + cond_dim, model_dim, 1)
+        # Input projection: path_dim only (no cond concat)
+        self.input_proj = nn.Conv1d(path_dim, model_dim, 1)
 
-        # Down path
-        self.down1 = ConvBlock1d(model_dim, model_dim, time_dim)
+        # Down path — cond injected at every block
+        self.down1 = ConvBlock1d(model_dim, model_dim, time_dim, cond_dim)
         self.down_sample1 = Downsample1d(model_dim)
-        self.down2 = ConvBlock1d(model_dim, model_dim * 2, time_dim)
+        self.down2 = ConvBlock1d(model_dim, model_dim * 2, time_dim, cond_dim)
         self.down_sample2 = Downsample1d(model_dim * 2)
-        self.down3 = ConvBlock1d(model_dim * 2, model_dim * 4, time_dim)
+        self.down3 = ConvBlock1d(model_dim * 2, model_dim * 4, time_dim, cond_dim)
         self.down_sample3 = Downsample1d(model_dim * 4)
 
         # Mid
-        self.mid1 = ConvBlock1d(model_dim * 4, model_dim * 4, time_dim)
+        self.mid1 = ConvBlock1d(model_dim * 4, model_dim * 4, time_dim, cond_dim)
         self.mid_attn = SelfAttention1d(model_dim * 4)
-        self.mid2 = ConvBlock1d(model_dim * 4, model_dim * 4, time_dim)
+        self.mid2 = ConvBlock1d(model_dim * 4, model_dim * 4, time_dim, cond_dim)
 
         # Up path
         self.up_sample3 = Upsample1d(model_dim * 4)
-        self.up3 = ConvBlock1d(model_dim * 4 * 2, model_dim * 2, time_dim)  # skip concat
+        self.up3 = ConvBlock1d(model_dim * 4 * 2, model_dim * 2, time_dim, cond_dim)
         self.up_sample2 = Upsample1d(model_dim * 2)
-        self.up2 = ConvBlock1d(model_dim * 2 * 2, model_dim, time_dim)
+        self.up2 = ConvBlock1d(model_dim * 2 * 2, model_dim, time_dim, cond_dim)
         self.up_sample1 = Upsample1d(model_dim)
-        self.up1 = ConvBlock1d(model_dim * 2, model_dim, time_dim)
+        self.up1 = ConvBlock1d(model_dim * 2, model_dim, time_dim, cond_dim)
 
         # Output projection
         self.output_proj = nn.Sequential(
@@ -247,38 +245,35 @@ class UNet1d(nn.Module):
         B, L, _ = x.shape
         t_emb = self.time_embed(t)  # [B, time_dim]
 
-        # Concatenate condition vector with each position
-        cond_expanded = cond.unsqueeze(1).expand(B, L, self.cond_dim)  # [B, L, cond_dim]
-        x = torch.cat([x, cond_expanded], dim=-1)  # [B, L, path_dim + cond_dim]
-        x = x.transpose(1, 2)  # [B, path_dim + cond_dim, L]
-
+        # Input projection (path only, no cond concat)
+        x = x.transpose(1, 2)  # [B, path_dim, L]
         x = self.input_proj(x)  # [B, model_dim, L]
 
-        # Down
-        h1 = self.down1(x, t_emb)            # [B, D, L]
-        h1d = self.down_sample1(h1)           # [B, D, L/2]
-        h2 = self.down2(h1d, t_emb)           # [B, 2D, L/2]
-        h2d = self.down_sample2(h2)           # [B, 2D, L/4]
-        h3 = self.down3(h2d, t_emb)           # [B, 4D, L/4]
-        h3d = self.down_sample3(h3)           # [B, 4D, L/8]
+        # Down — cond injected at every block
+        h1 = self.down1(x, t_emb, cond)       # [B, D, L]
+        h1d = self.down_sample1(h1)            # [B, D, L/2]
+        h2 = self.down2(h1d, t_emb, cond)      # [B, 2D, L/2]
+        h2d = self.down_sample2(h2)            # [B, 2D, L/4]
+        h3 = self.down3(h2d, t_emb, cond)      # [B, 4D, L/4]
+        h3d = self.down_sample3(h3)            # [B, 4D, L/8]
 
         # Mid
-        m = self.mid1(h3d, t_emb)
+        m = self.mid1(h3d, t_emb, cond)
         m = self.mid_attn(m)
-        m = self.mid2(m, t_emb)
+        m = self.mid2(m, t_emb, cond)
 
-        # Up (with skip connections + padding to match sizes)
-        u3 = self.up_sample3(m)                         # [B, 4D, L/4]
+        # Up (with skip connections)
+        u3 = self.up_sample3(m)
         u3 = _pad_to_match(u3, h3)
-        u3 = self.up3(torch.cat([u3, h3], dim=1), t_emb)  # [B, 2D, L/4]
+        u3 = self.up3(torch.cat([u3, h3], dim=1), t_emb, cond)
 
-        u2 = self.up_sample2(u3)                         # [B, 2D, L/2]
+        u2 = self.up_sample2(u3)
         u2 = _pad_to_match(u2, h2)
-        u2 = self.up2(torch.cat([u2, h2], dim=1), t_emb)  # [B, D, L/2]
+        u2 = self.up2(torch.cat([u2, h2], dim=1), t_emb, cond)
 
-        u1 = self.up_sample1(u2)                         # [B, D, L]
+        u1 = self.up_sample1(u2)
         u1 = _pad_to_match(u1, h1)
-        u1 = self.up1(torch.cat([u1, h1], dim=1), t_emb)  # [B, D, L]
+        u1 = self.up1(torch.cat([u1, h1], dim=1), t_emb, cond)
 
         out = self.output_proj(u1)  # [B, path_dim, L]
         return out.transpose(1, 2)  # [B, L, path_dim]

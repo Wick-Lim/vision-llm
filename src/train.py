@@ -87,9 +87,16 @@ def train(
             # Predict noise
             pred_noise = unet(x_t, t, cond)
 
-            loss = nn.functional.mse_loss(pred_noise, noise)
+            # Weighted loss: 10x on content rows, 1x on padding
+            content_mask = (tgt[:, :, 0] > -0.45).float()
+            weight = (1.0 + 9.0 * content_mask).unsqueeze(-1)
+            loss = (weight * (pred_noise - noise) ** 2).mean()
+
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(unet.parameters()), max_norm=1.0
+            )
             optimizer.step()
 
             train_loss += loss.item() * B
@@ -114,7 +121,9 @@ def train(
                 x_t = scheduler.add_noise(tgt, noise, t)
                 pred_noise = unet(x_t, t, cond)
 
-                val_loss += nn.functional.mse_loss(pred_noise, noise).item() * B
+                content_mask = (tgt[:, :, 0] > -0.45).float()
+                weight = (1.0 + 9.0 * content_mask).unsqueeze(-1)
+                val_loss += (weight * (pred_noise - noise) ** 2).mean().item() * B
                 n_val += B
 
         val_loss /= n_val

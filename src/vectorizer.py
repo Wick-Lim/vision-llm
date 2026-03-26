@@ -18,10 +18,22 @@ CMD_MOVE = 1
 CMD_LINE = 2
 CMD_CURVE = 3  # cubic bezier (2 control points)
 CMD_CLOSE = 4
+NUM_CMDS = 5  # 0..4
 
 # Tensor column layout: [cmd, x, y, cx1, cy1, cx2, cy2, flag]
 TENSOR_DIM = 8
 DEFAULT_MAX_LEN = 512
+
+
+def _normalize_cmd(cmd: int) -> float:
+    """Map cmd integer [0..4] → [-0.5, 0.5] range."""
+    return cmd / (NUM_CMDS - 1) - 0.5  # 0→-0.5, 1→-0.25, 2→0.0, 3→0.25, 4→0.5
+
+
+def _denormalize_cmd(val: float) -> int:
+    """Map normalized cmd back to integer, clamped to valid range."""
+    cmd = round((val + 0.5) * (NUM_CMDS - 1))
+    return max(0, min(NUM_CMDS - 1, cmd))
 
 # Font search paths (macOS → Linux)
 FONT_PATHS = [
@@ -198,8 +210,12 @@ def paths_to_tensor(
     """Convert path commands to a fixed-size tensor [max_len, 8].
 
     Coordinates are normalized to [-0.5, 0.5] relative to bounding box.
+    cmd values are also normalized to [-0.5, 0.5] so all channels share the same scale.
+    Padding rows use _normalize_cmd(CMD_PAD) = -0.5 for all values.
     """
-    tensor = torch.zeros(max_len, TENSOR_DIM)
+    # Fill with padding value (-0.5) instead of zeros
+    pad_val = _normalize_cmd(CMD_PAD)
+    tensor = torch.full((max_len, TENSOR_DIM), pad_val)
 
     # Compute normalization from bounds
     if bounds is None:
@@ -227,17 +243,17 @@ def paths_to_tensor(
             break
         if cmd == "moveTo":
             nx, ny = norm(*pts[0])
-            tensor[idx] = torch.tensor([CMD_MOVE, nx, ny, 0, 0, 0, 0, 0])
+            tensor[idx] = torch.tensor([_normalize_cmd(CMD_MOVE), nx, ny, 0, 0, 0, 0, 0])
         elif cmd == "lineTo":
             nx, ny = norm(*pts[0])
-            tensor[idx] = torch.tensor([CMD_LINE, nx, ny, 0, 0, 0, 0, 0])
+            tensor[idx] = torch.tensor([_normalize_cmd(CMD_LINE), nx, ny, 0, 0, 0, 0, 0])
         elif cmd == "curveTo":
             nx, ny = norm(*pts[2])  # endpoint
             cx1, cy1 = norm(*pts[0])  # control 1
             cx2, cy2 = norm(*pts[1])  # control 2
-            tensor[idx] = torch.tensor([CMD_CURVE, nx, ny, cx1, cy1, cx2, cy2, 0])
+            tensor[idx] = torch.tensor([_normalize_cmd(CMD_CURVE), nx, ny, cx1, cy1, cx2, cy2, 0])
         elif cmd == "closePath":
-            tensor[idx] = torch.tensor([CMD_CLOSE, 0, 0, 0, 0, 0, 0, 0])
+            tensor[idx] = torch.tensor([_normalize_cmd(CMD_CLOSE), 0, 0, 0, 0, 0, 0, 0])
         idx += 1
 
     return tensor
@@ -257,7 +273,7 @@ def tensor_to_paths(
 
     paths = []
     for row in tensor:
-        cmd = int(round(row[0].item()))
+        cmd = _denormalize_cmd(row[0].item())
         if cmd == CMD_PAD:
             continue
         elif cmd == CMD_MOVE:

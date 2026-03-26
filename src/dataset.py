@@ -73,8 +73,9 @@ class GlyphEchoDataset(Dataset):
                 paths = extract_glyph(self.font, char)
                 bounds = get_glyph_bounds(self.font, char)
                 tensor = paths_to_tensor(paths, max_len=max_len, bounds=bounds)
-                # Skip empty glyphs
-                if tensor.abs().sum() > 0:
+                # Skip empty glyphs (all-pad tensors have cmd col = -0.5)
+                has_content = (tensor[:, 0] > -0.4).any()
+                if has_content:
                     self.tensors.append(tensor)
                 else:
                     skipped += 1
