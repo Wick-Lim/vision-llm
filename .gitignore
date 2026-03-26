@@ -5,3 +5,5 @@ dist/
 build/
 checkpoints/*.pt
 .venv/
+demo_input.png
+demo_output.png

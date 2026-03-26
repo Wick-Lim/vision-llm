@@ -40,8 +40,8 @@ class PathEncoder(nn.Module):
 
         feat = self.conv(x.transpose(1, 2))  # [B, 256, L/8]
 
-        # Downsample mask to match conv output (8x downsample)
-        mask_down = F.max_pool1d(mask.unsqueeze(1), kernel_size=8).squeeze(1)  # [B, L/8]
+        # Downsample mask with avg pooling (content density, not all-or-nothing)
+        mask_down = F.avg_pool1d(mask.unsqueeze(1), kernel_size=8).squeeze(1)  # [B, L/8]
 
         # Masked average pooling: only content positions
         masked_feat = feat * mask_down.unsqueeze(1)  # [B, 256, L/8]

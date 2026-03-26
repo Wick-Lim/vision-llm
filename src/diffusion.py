@@ -67,7 +67,7 @@ class NoiseScheduler:
             alpha_t = self.alphas_cumprod[t].to(device)
             # Predict x_0
             x0_pred = (x - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-            x0_pred = x0_pred.clamp(-0.6, 0.6)
+            x0_pred = x0_pred.clamp(-0.5, 0.5)
 
             if i < len(timesteps) - 1:
                 t_prev = timesteps[i + 1]

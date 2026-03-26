@@ -4,12 +4,15 @@ import modal
 
 app = modal.App("vision-llm-train")
 
-# Image with dependencies
+# Image with dependencies + local font for consistency
+FONT_PATH = "/root/fonts/AppleSDGothicNeo.ttc"
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("fonts-nanum")
     .pip_install("torch", "fonttools", "Pillow", "numpy<2")
+    .env({"VISION_LLM_FONT": FONT_PATH})
     .add_local_dir("src", remote_path="/root/project/src")
+    .add_local_dir("fonts", remote_path="/root/fonts")
 )
 
 # Volume for checkpoints persistence
@@ -26,7 +29,7 @@ def train_gpu(
     epochs: int = 300,
     batch_size: int = 64,
     lr: float = 3e-4,
-    max_len: int = 256,
+    max_len: int = 128,
     max_chars: int = 500,
 ):
     import sys
@@ -35,6 +38,7 @@ def train_gpu(
     from src.train import train
 
     train(
+        font_path=FONT_PATH,
         epochs=epochs,
         batch_size=batch_size,
         lr=lr,
@@ -53,7 +57,7 @@ def main():
         epochs=300,
         batch_size=64,
         lr=3e-4,
-        max_len=256,
+        max_len=128,
         max_chars=500,
     )
 

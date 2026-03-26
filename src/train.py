@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-from .dataset import GlyphEchoDataset
+from .dataset import GlyphEchoDataset, collate_glyph_batch
 from .diffusion import NoiseScheduler, UNet1d
 from .encoder import PathEncoder
 from .vectorizer import DEFAULT_MAX_LEN
@@ -38,8 +38,8 @@ def train(
     train_size = len(dataset) - val_size
     train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, num_workers=0)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_glyph_batch)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, num_workers=0, collate_fn=collate_glyph_batch)
 
     # Models
     encoder = PathEncoder(cond_dim=cond_dim).to(device)
@@ -87,10 +87,10 @@ def train(
             # Predict noise
             pred_noise = unet(x_t, t, cond)
 
-            # Weighted loss: 10x on content rows, 1x on padding
-            content_mask = (tgt[:, :, 0] > -0.45).float()
-            weight = (1.0 + 9.0 * content_mask).unsqueeze(-1)
-            loss = (weight * (pred_noise - noise) ** 2).mean()
+            # Content-only loss: zero out padding rows entirely
+            content_mask = (tgt[:, :, 0] > -0.45).float().unsqueeze(-1)  # [B, L, 1]
+            sq_err = (pred_noise - noise) ** 2 * content_mask
+            loss = sq_err.sum() / content_mask.sum().clamp(min=1)
 
             optimizer.zero_grad()
             loss.backward()
@@ -121,9 +121,9 @@ def train(
                 x_t = scheduler.add_noise(tgt, noise, t)
                 pred_noise = unet(x_t, t, cond)
 
-                content_mask = (tgt[:, :, 0] > -0.45).float()
-                weight = (1.0 + 9.0 * content_mask).unsqueeze(-1)
-                val_loss += (weight * (pred_noise - noise) ** 2).mean().item() * B
+                content_mask = (tgt[:, :, 0] > -0.45).float().unsqueeze(-1)
+                sq_err = (pred_noise - noise) ** 2 * content_mask
+                val_loss += (sq_err.sum() / content_mask.sum().clamp(min=1)).item() * B
                 n_val += B
 
         val_loss /= n_val
