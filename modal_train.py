@@ -54,7 +54,7 @@ def train_gpu(
 @app.local_entrypoint()
 def main():
     train_gpu.remote(
-        epochs=300,
+        epochs=1000,
         batch_size=64,
         lr=3e-4,
         max_len=128,

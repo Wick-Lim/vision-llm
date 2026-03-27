@@ -1,17 +1,23 @@
-"""Training loop for vector path diffusion model."""
+"""Training loop for vector path diffusion model.
+
+Diffusion operates on coordinates only (dims 1-7).
+Command types (dim 0) are predicted via cross-entropy classification.
+"""
 
 import argparse
+import copy
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from .dataset import GlyphEchoDataset, collate_glyph_batch
-from .diffusion import NoiseScheduler, UNet1d
+from .diffusion import COORD_DIM, NoiseScheduler, UNet1d, ema_update
 from .encoder import PathEncoder
-from .vectorizer import DEFAULT_MAX_LEN
+from .vectorizer import DEFAULT_MAX_LEN, NUM_CMDS, _denormalize_cmd
 
 
 def train(
@@ -34,7 +40,7 @@ def train(
 
     # Dataset
     dataset = GlyphEchoDataset(font_path=font_path, max_len=max_len, max_chars=max_chars)
-    val_size = max(1, len(dataset) // 10)
+    val_size = max(1, len(dataset) // 5)  # 20% val
     train_size = len(dataset) - val_size
     train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
@@ -46,11 +52,14 @@ def train(
     unet = UNet1d(cond_dim=cond_dim, model_dim=model_dim).to(device)
     scheduler = NoiseScheduler(num_timesteps=num_timesteps)
 
+    # EMA copies for stable sampling
+    ema_encoder = copy.deepcopy(encoder)
+    ema_unet = copy.deepcopy(unet)
+
     total_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in unet.parameters())
     print(f"Parameters: encoder={sum(p.numel() for p in encoder.parameters()):,} "
           f"unet={sum(p.numel() for p in unet.parameters()):,} total={total_params:,}")
 
-    # Optimizer (joint for encoder + unet)
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) + list(unet.parameters()),
         lr=lr,
@@ -74,23 +83,39 @@ def train(
             src, tgt = src.to(device), tgt.to(device)
             B = src.size(0)
 
-            # Encode condition
+            # Split target into cmd indices and coordinates
+            cmd_normalized = tgt[:, :, 0]  # [B, L] normalized cmd values
+            coords = tgt[:, :, 1:]         # [B, L, 7] coordinates
+
+            # Convert normalized cmd to integer indices for cross-entropy
+            cmd_indices = ((cmd_normalized + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
+
+            # Content mask from cmd (non-pad positions)
+            content_mask = (cmd_indices > 0).float()  # [B, L]
+
+            # Encode condition (full tensor including cmd)
             cond = encoder(src)
 
-            # Sample random timesteps
+            # Forward diffusion on COORDINATES ONLY
             t = torch.randint(0, num_timesteps, (B,), device=device)
+            noise = torch.randn_like(coords)
+            coords_noisy = scheduler.add_noise(coords, noise, t)
 
-            # Forward diffusion on target
-            noise = torch.randn_like(tgt)
-            x_t = scheduler.add_noise(tgt, noise, t)
+            # Predict
+            pred_noise, cmd_logits = unet(coords_noisy, t, cond)
 
-            # Predict noise
-            pred_noise = unet(x_t, t, cond)
+            # Loss 1: MSE on coordinate noise (content only)
+            coord_mask = content_mask.unsqueeze(-1)  # [B, L, 1]
+            coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
 
-            # Content-only loss: zero out padding rows entirely
-            content_mask = (tgt[:, :, 0] > -0.45).float().unsqueeze(-1)  # [B, L, 1]
-            sq_err = (pred_noise - noise) ** 2 * content_mask
-            loss = sq_err.sum() / content_mask.sum().clamp(min=1)
+            # Loss 2: Cross-entropy on cmd classification (ALL positions, including PAD)
+            # Model must learn WHEN to stop (predict PAD)
+            cmd_loss = F.cross_entropy(
+                cmd_logits.reshape(-1, NUM_CMDS),
+                cmd_indices.reshape(-1),
+            )
+
+            loss = coord_loss + cmd_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -98,6 +123,10 @@ def train(
                 list(encoder.parameters()) + list(unet.parameters()), max_norm=1.0
             )
             optimizer.step()
+
+            # EMA update
+            ema_update(ema_encoder, encoder)
+            ema_update(ema_unet, unet)
 
             train_loss += loss.item() * B
             n_train += B
@@ -115,15 +144,22 @@ def train(
                 src, tgt = src.to(device), tgt.to(device)
                 B = src.size(0)
 
+                cmd_normalized = tgt[:, :, 0]
+                coords = tgt[:, :, 1:]
+                cmd_indices = ((cmd_normalized + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
+                content_mask = (cmd_indices > 0).float()
+
                 cond = encoder(src)
                 t = torch.randint(0, num_timesteps, (B,), device=device)
-                noise = torch.randn_like(tgt)
-                x_t = scheduler.add_noise(tgt, noise, t)
-                pred_noise = unet(x_t, t, cond)
+                noise = torch.randn_like(coords)
+                coords_noisy = scheduler.add_noise(coords, noise, t)
+                pred_noise, cmd_logits = unet(coords_noisy, t, cond)
 
-                content_mask = (tgt[:, :, 0] > -0.45).float().unsqueeze(-1)
-                sq_err = (pred_noise - noise) ** 2 * content_mask
-                val_loss += (sq_err.sum() / content_mask.sum().clamp(min=1)).item() * B
+                coord_mask = content_mask.unsqueeze(-1)
+                coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
+                cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_indices.reshape(-1))
+
+                val_loss += (coord_loss + cmd_loss).item() * B
                 n_val += B
 
         val_loss /= n_val
@@ -132,19 +168,18 @@ def train(
 
         print(f"[{epoch:3d}/{epochs}] train={train_loss:.6f} val={val_loss:.6f} ({elapsed:.1f}s)")
 
-        # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
-                "encoder": encoder.state_dict(),
-                "unet": unet.state_dict(),
+                "encoder": ema_encoder.state_dict(),
+                "unet": ema_unet.state_dict(),
                 "epoch": epoch,
                 "val_loss": val_loss,
             }, save_path / "best.pt")
 
     torch.save({
-        "encoder": encoder.state_dict(),
-        "unet": unet.state_dict(),
+        "encoder": ema_encoder.state_dict(),
+        "unet": ema_unet.state_dict(),
         "epoch": epochs,
         "val_loss": val_loss,
     }, save_path / "last.pt")
@@ -153,14 +188,14 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(description="Train Vector Path Diffusion Model")
-    parser.add_argument("--font", type=str, default=None, help="Path to TTF/OTF font file")
+    parser.add_argument("--font", type=str, default=None)
     parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--timesteps", type=int, default=1000)
-    parser.add_argument("--max-chars", type=int, default=None, help="Limit number of glyphs (for fast iteration)")
+    parser.add_argument("--max-chars", type=int, default=None)
     args = parser.parse_args()
 
     train(

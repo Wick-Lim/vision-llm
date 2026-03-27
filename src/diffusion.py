@@ -1,29 +1,41 @@
 """1D U-Net diffusion model for vector path generation.
 
-Generates vector path sequences conditioned on an encoder output.
-Uses a 1D U-Net architecture operating on [B, max_len, path_dim] tensors.
+Key design: diffusion operates ONLY on coordinates (dims 1-7).
+Command types (dim 0) are predicted via classification head, not diffused.
 """
 
+import copy
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .vectorizer import TENSOR_DIM
+from .vectorizer import NUM_CMDS, TENSOR_DIM
+
+# Coordinate dimensions (x, y, cx1, cy1, cx2, cy2, flag)
+COORD_DIM = TENSOR_DIM - 1  # 7
 
 
 # ============================================================
-# Noise scheduler
+# Noise scheduler (cosine)
 # ============================================================
 
 
 class NoiseScheduler:
-    """Linear beta noise schedule for diffusion."""
+    """Cosine beta noise schedule (Nichol & Dhariwal, 2021)."""
 
-    def __init__(self, num_timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 0.02):
+    def __init__(self, num_timesteps: int = 1000):
         self.num_timesteps = num_timesteps
-        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+
+        # Cosine schedule
+        s = 0.008
+        steps = torch.arange(num_timesteps + 1, dtype=torch.float64)
+        alphas_cumprod = torch.cos(((steps / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = torch.clip(betas, 0.0001, 0.9999).float()
+
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
@@ -34,11 +46,10 @@ class NoiseScheduler:
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
     def add_noise(self, x0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Forward diffusion: q(x_t | x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise."""
+        """Forward diffusion on coordinates only."""
         sqrt_alpha = self.sqrt_alphas_cumprod[t.cpu()].to(x0.device)
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t.cpu()].to(x0.device)
 
-        # Reshape for broadcasting: [B] → [B, 1, 1]
         while sqrt_alpha.dim() < x0.dim():
             sqrt_alpha = sqrt_alpha.unsqueeze(-1)
             sqrt_one_minus = sqrt_one_minus.unsqueeze(-1)
@@ -49,35 +60,42 @@ class NoiseScheduler:
     def ddim_sample(
         self,
         model: nn.Module,
-        shape: tuple,
+        shape_coords: tuple,
         cond: torch.Tensor,
-        num_steps: int = 50,
+        num_steps: int = 100,
         device: str = "cpu",
-    ) -> torch.Tensor:
-        """DDIM deterministic sampling (eta=0)."""
-        # Create sub-sequence of timesteps: high → low
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DDIM sampling. Returns (coords [B,L,7], cmd_probs [B,L,NUM_CMDS])."""
+        B, L, _ = shape_coords
         timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long).tolist()
 
-        x = torch.randn(shape, device=device)
+        x = torch.randn(shape_coords, device=device)
+        cmd_logits_accum = None
 
         for i, t in enumerate(timesteps):
-            t_tensor = torch.full((shape[0],), t, device=device, dtype=torch.long)
-            pred_noise = model(x, t_tensor, cond)
+            t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
+            pred_noise, cmd_logits = model(x, t_tensor, cond)
+
+            # Accumulate cmd predictions (later steps are more reliable)
+            if cmd_logits_accum is None:
+                cmd_logits_accum = cmd_logits
+            else:
+                # Exponential moving average — later predictions weighted more
+                cmd_logits_accum = 0.9 * cmd_logits + 0.1 * cmd_logits_accum
 
             alpha_t = self.alphas_cumprod[t].to(device)
-            # Predict x_0
             x0_pred = (x - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
             x0_pred = x0_pred.clamp(-0.5, 0.5)
 
             if i < len(timesteps) - 1:
                 t_prev = timesteps[i + 1]
                 alpha_prev = self.alphas_cumprod[t_prev].to(device)
-                # DDIM update (eta=0, deterministic)
                 x = torch.sqrt(alpha_prev) * x0_pred + torch.sqrt(1 - alpha_prev) * pred_noise
             else:
                 x = x0_pred
 
-        return x
+        cmd_probs = F.softmax(cmd_logits_accum, dim=-1)
+        return x, cmd_probs
 
 
 # ============================================================
@@ -85,34 +103,22 @@ class NoiseScheduler:
 # ============================================================
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    """Sinusoidal positional embedding for diffusion timesteps."""
-
+class TimeMLPEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device).float() / half)
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
-        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-
-class TimeMLPEmbedding(nn.Module):
-    """Sinusoidal → MLP for time conditioning."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.sinusoidal = SinusoidalTimeEmbedding(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim),
-        )
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.sinusoidal(t))
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        return self.mlp(emb)
 
 
 # ============================================================
@@ -121,14 +127,13 @@ class TimeMLPEmbedding(nn.Module):
 
 
 class ConvBlock1d(nn.Module):
-    """Conv1d → GroupNorm → SiLU, with time + condition embedding injection."""
-
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int, cond_dim: int = 256):
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, cond_dim: int = 256, dropout: float = 0.1):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(in_ch, out_ch, 3, padding=1),
             nn.GroupNorm(8, out_ch),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Conv1d(out_ch, out_ch, 3, padding=1),
             nn.GroupNorm(8, out_ch),
             nn.SiLU(),
@@ -137,78 +142,57 @@ class ConvBlock1d(nn.Module):
         self.cond_proj = nn.Linear(cond_dim, out_ch)
         self.res_conv = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, t_emb, cond_emb):
         h = self.conv(x) + self.time_proj(t_emb).unsqueeze(-1) + self.cond_proj(cond_emb).unsqueeze(-1)
         return h + self.res_conv(x)
 
 
 class SelfAttention1d(nn.Module):
-    """Multi-head self-attention over sequence dimension."""
-
     def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
         self.norm = nn.GroupNorm(8, channels)
         self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, L]
-        h = self.norm(x)
-        h = h.transpose(1, 2)  # [B, L, C]
+    def forward(self, x):
+        h = self.norm(x).transpose(1, 2)
         h, _ = self.attn(h, h, h)
-        h = h.transpose(1, 2)  # [B, C, L]
-        return x + h
+        return x + h.transpose(1, 2)
 
 
 class Downsample1d(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv = nn.Conv1d(channels, channels, 3, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+    def __init__(self, ch): super().__init__(); self.conv = nn.Conv1d(ch, ch, 3, stride=2, padding=1)
+    def forward(self, x): return self.conv(x)
 
 
 class Upsample1d(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(channels, channels, 4, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+    def __init__(self, ch): super().__init__(); self.conv = nn.ConvTranspose1d(ch, ch, 4, stride=2, padding=1)
+    def forward(self, x): return self.conv(x)
 
 
 # ============================================================
-# 1D U-Net
+# 1D U-Net with separate coord/cmd heads
 # ============================================================
 
 
 class UNet1d(nn.Module):
-    """1D U-Net for sequence diffusion.
+    """1D U-Net for vector path diffusion.
 
-    Input:  noisy paths [B, max_len, path_dim]
-    Output: predicted noise [B, max_len, path_dim]
+    Diffusion operates on coordinates only (7 dims).
+    Command types are predicted via classification head (5 classes).
 
-    Conditioning via additive injection at every ConvBlock.
+    Input:  noisy coords [B, L, 7]
+    Output: (pred_noise [B, L, 7], cmd_logits [B, L, NUM_CMDS])
     """
 
-    def __init__(
-        self,
-        path_dim: int = TENSOR_DIM,
-        cond_dim: int = 256,
-        model_dim: int = 128,
-        time_dim: int = 128,
-    ):
+    def __init__(self, cond_dim: int = 256, model_dim: int = 128, time_dim: int = 128):
         super().__init__()
-        self.path_dim = path_dim
         self.cond_dim = cond_dim
-
-        # Time embedding
         self.time_embed = TimeMLPEmbedding(time_dim)
 
-        # Input projection: path_dim only (no cond concat)
-        self.input_proj = nn.Conv1d(path_dim, model_dim, 1)
+        # Input: coords only (7 dims)
+        self.input_proj = nn.Conv1d(COORD_DIM, model_dim, 1)
 
-        # Down path — cond injected at every block
+        # Down
         self.down1 = ConvBlock1d(model_dim, model_dim, time_dim, cond_dim)
         self.down_sample1 = Downsample1d(model_dim)
         self.down2 = ConvBlock1d(model_dim, model_dim * 2, time_dim, cond_dim)
@@ -221,7 +205,7 @@ class UNet1d(nn.Module):
         self.mid_attn = SelfAttention1d(model_dim * 4)
         self.mid2 = ConvBlock1d(model_dim * 4, model_dim * 4, time_dim, cond_dim)
 
-        # Up path
+        # Up
         self.up_sample3 = Upsample1d(model_dim * 4)
         self.up3 = ConvBlock1d(model_dim * 4 * 2, model_dim * 2, time_dim, cond_dim)
         self.up_sample2 = Upsample1d(model_dim * 2)
@@ -229,61 +213,63 @@ class UNet1d(nn.Module):
         self.up_sample1 = Upsample1d(model_dim)
         self.up1 = ConvBlock1d(model_dim * 2, model_dim, time_dim, cond_dim)
 
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.GroupNorm(8, model_dim),
-            nn.SiLU(),
-            nn.Conv1d(model_dim, path_dim, 1),
+        # Two output heads
+        self.coord_head = nn.Sequential(
+            nn.GroupNorm(8, model_dim), nn.SiLU(),
+            nn.Conv1d(model_dim, COORD_DIM, 1),
+        )
+        self.cmd_head = nn.Sequential(
+            nn.GroupNorm(8, model_dim), nn.SiLU(),
+            nn.Conv1d(model_dim, NUM_CMDS, 1),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """
-        x:    [B, max_len, path_dim] noisy path sequence
-        t:    [B] integer timesteps
-        cond: [B, cond_dim] condition vector from encoder
-        """
+    def forward(self, x, t, cond):
+        """x: [B, L, 7] noisy coords. Returns (noise_pred [B,L,7], cmd_logits [B,L,5])."""
         B, L, _ = x.shape
-        t_emb = self.time_embed(t)  # [B, time_dim]
+        t_emb = self.time_embed(t)
 
-        # Input projection (path only, no cond concat)
-        x = x.transpose(1, 2)  # [B, path_dim, L]
-        x = self.input_proj(x)  # [B, model_dim, L]
+        x = x.transpose(1, 2)
+        x = self.input_proj(x)
 
-        # Down — cond injected at every block
-        h1 = self.down1(x, t_emb, cond)       # [B, D, L]
-        h1d = self.down_sample1(h1)            # [B, D, L/2]
-        h2 = self.down2(h1d, t_emb, cond)      # [B, 2D, L/2]
-        h2d = self.down_sample2(h2)            # [B, 2D, L/4]
-        h3 = self.down3(h2d, t_emb, cond)      # [B, 4D, L/4]
-        h3d = self.down_sample3(h3)            # [B, 4D, L/8]
+        h1 = self.down1(x, t_emb, cond)
+        h1d = self.down_sample1(h1)
+        h2 = self.down2(h1d, t_emb, cond)
+        h2d = self.down_sample2(h2)
+        h3 = self.down3(h2d, t_emb, cond)
+        h3d = self.down_sample3(h3)
 
-        # Mid
         m = self.mid1(h3d, t_emb, cond)
         m = self.mid_attn(m)
         m = self.mid2(m, t_emb, cond)
 
-        # Up (with skip connections)
-        u3 = self.up_sample3(m)
-        u3 = _pad_to_match(u3, h3)
+        u3 = _pad_to_match(self.up_sample3(m), h3)
         u3 = self.up3(torch.cat([u3, h3], dim=1), t_emb, cond)
-
-        u2 = self.up_sample2(u3)
-        u2 = _pad_to_match(u2, h2)
+        u2 = _pad_to_match(self.up_sample2(u3), h2)
         u2 = self.up2(torch.cat([u2, h2], dim=1), t_emb, cond)
-
-        u1 = self.up_sample1(u2)
-        u1 = _pad_to_match(u1, h1)
+        u1 = _pad_to_match(self.up_sample1(u2), h1)
         u1 = self.up1(torch.cat([u1, h1], dim=1), t_emb, cond)
 
-        out = self.output_proj(u1)  # [B, path_dim, L]
-        return out.transpose(1, 2)  # [B, L, path_dim]
+        noise_pred = self.coord_head(u1).transpose(1, 2)  # [B, L, 7]
+        cmd_logits = self.cmd_head(u1).transpose(1, 2)     # [B, L, 5]
+        return noise_pred, cmd_logits
 
 
-def _pad_to_match(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Pad x along sequence dim to match target size."""
+def _pad_to_match(x, target):
     diff = target.shape[-1] - x.shape[-1]
     if diff > 0:
         x = F.pad(x, (0, diff))
     elif diff < 0:
         x = x[..., :target.shape[-1]]
     return x
+
+
+# ============================================================
+# EMA helper
+# ============================================================
+
+
+def ema_update(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999):
+    """Update EMA weights."""
+    with torch.no_grad():
+        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+            p_ema.data.mul_(decay).add_(p.data, alpha=1 - decay)
