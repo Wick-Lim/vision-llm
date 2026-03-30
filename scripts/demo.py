@@ -45,8 +45,8 @@ def run_pipeline(
 
     # 2. Load models
     print(f"[2] Loading model from {checkpoint}...")
-    encoder = PathEncoder(cond_dim=256).to(device)
-    unet = UNet1d(cond_dim=256, model_dim=128).to(device)
+    encoder = PathEncoder(feat_dim=256).to(device)
+    unet = UNet1d(context_dim=256, model_dim=128).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     encoder.load_state_dict(ckpt["encoder"])
     unet.load_state_dict(ckpt["unet"])
@@ -57,7 +57,7 @@ def run_pipeline(
     print("[3] Encoding condition...")
     input_batch = input_tensor.unsqueeze(0).to(device)
     with torch.no_grad():
-        cond, _ = encoder(input_batch)
+        context, _ = encoder(input_batch)
 
     # For echo task: use input cmd values directly
     true_cmds = ((input_tensor[:, 0] + 0.5) * 4).round().long().clamp(0, 4)
@@ -70,7 +70,7 @@ def run_pipeline(
         coords = scheduler.ddim_sample(
             unet,
             shape_coords=(1, max_len, COORD_DIM),
-            cond=cond,
+            context=context,
             num_steps=ddim_steps,
             device=device,
         )

@@ -48,8 +48,8 @@ def train(
     val_dl = DataLoader(val_ds, batch_size=batch_size, num_workers=0, collate_fn=collate_glyph_batch)
 
     # Models
-    encoder = PathEncoder(cond_dim=cond_dim).to(device)
-    unet = UNet1d(cond_dim=cond_dim, model_dim=model_dim).to(device)
+    encoder = PathEncoder(feat_dim=cond_dim).to(device)
+    unet = UNet1d(context_dim=cond_dim, model_dim=model_dim).to(device)
     scheduler = NoiseScheduler(num_timesteps=num_timesteps)
 
     # EMA copies for stable sampling
@@ -94,7 +94,7 @@ def train(
             content_mask = (cmd_indices > 0).float()  # [B, L]
 
             # Encode: condition vector + cmd prediction from CLEAN input
-            cond, cmd_logits = encoder(src)
+            context, cmd_logits = encoder(src)
 
             # Forward diffusion on COORDINATES ONLY (no noise on padding)
             t = torch.randint(0, num_timesteps, (B,), device=device)
@@ -104,7 +104,7 @@ def train(
             coords_noisy = scheduler.add_noise(coords, noise, t)
 
             # UNet predicts coord noise only
-            pred_noise = unet(coords_noisy, t, cond)
+            pred_noise = unet(coords_noisy, t, context)
 
             # Loss 1: MSE on coordinate noise (content only)
             coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
@@ -149,13 +149,13 @@ def train(
                 cmd_indices = ((cmd_normalized + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
                 content_mask = (cmd_indices > 0).float()
 
-                cond, cmd_logits = encoder(src)
+                context, cmd_logits = encoder(src)
                 t = torch.randint(0, num_timesteps, (B,), device=device)
                 noise = torch.randn_like(coords)
                 coord_mask = content_mask.unsqueeze(-1)
                 noise = noise * coord_mask
                 coords_noisy = scheduler.add_noise(coords, noise, t)
-                pred_noise = unet(coords_noisy, t, cond)
+                pred_noise = unet(coords_noisy, t, context)
 
                 coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
                 cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_indices.reshape(-1))
