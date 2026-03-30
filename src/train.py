@@ -90,8 +90,12 @@ def train(
             # Content mask from cmd (non-pad positions)
             content_mask = (cmd_indices > 0).float()  # [B, L]
 
-            # Encode: condition vector + cmd prediction from CLEAN input
+            # Encode: feature sequence + cmd prediction from CLEAN input
             context, cmd_logits = encoder(src)
+
+            # CFG: 15% of the time, drop condition (replace with zeros)
+            if torch.rand(1).item() < 0.15:
+                context = torch.zeros_like(context)
 
             # Forward diffusion on COORDINATES ONLY (no noise on padding)
             t = torch.randint(0, num_timesteps, (B,), device=device)

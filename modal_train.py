@@ -55,11 +55,11 @@ def train_gpu(
 @app.local_entrypoint()
 def main():
     train_gpu.remote(
-        epochs=1000,
+        epochs=5000,
         batch_size=64,
         lr=3e-4,
         max_len=128,
-        max_chars=500,
+        max_chars=50,
     )
 
     # Download checkpoints locally

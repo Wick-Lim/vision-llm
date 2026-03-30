@@ -45,15 +45,24 @@ class NoiseScheduler:
         return sa * x0 + sb * noise
 
     @torch.no_grad()
-    def ddim_sample(self, model, shape_coords, context, num_steps=100, device="cpu"):
-        """DDIM sampling. context: [B, S, 256] encoder feature sequence."""
+    def ddim_sample(self, model, shape_coords, context, num_steps=200, device="cpu", guidance_scale=3.0):
+        """DDIM sampling with classifier-free guidance."""
         B, L, _ = shape_coords
         timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long).tolist()
         x = torch.randn(shape_coords, device=device)
+        null_context = torch.zeros_like(context)
 
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
-            pred_noise = model(x, t_tensor, context)
+
+            # CFG: guided noise prediction
+            if guidance_scale > 1.0:
+                noise_cond = model(x, t_tensor, context)
+                noise_uncond = model(x, t_tensor, null_context)
+                pred_noise = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            else:
+                pred_noise = model(x, t_tensor, context)
+
             alpha_t = self.alphas_cumprod[t].to(device)
             x0_pred = (x - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
             x0_pred = x0_pred.clamp(-0.5, 0.5)

@@ -26,7 +26,8 @@ def run_pipeline(
     checkpoint: str,
     font_path: str | None = None,
     max_len: int = DEFAULT_MAX_LEN,
-    ddim_steps: int = 100,
+    ddim_steps: int = 200,
+    guidance_scale: float = 3.0,
     device: str | None = None,
 ) -> None:
     if device is None:
@@ -64,7 +65,7 @@ def run_pipeline(
     cmd_indices = true_cmds
 
     # 4. Generate coordinates via diffusion
-    print(f"[4] Generating coords via DDIM ({ddim_steps} steps)...")
+    print(f"[4] Generating coords via DDIM ({ddim_steps} steps, guidance={guidance_scale})...")
     scheduler = NoiseScheduler(num_timesteps=1000)
     with torch.no_grad():
         coords = scheduler.ddim_sample(
@@ -73,6 +74,7 @@ def run_pipeline(
             context=context,
             num_steps=ddim_steps,
             device=device,
+            guidance_scale=guidance_scale,
         )
 
     # 5. Reconstruct full tensor: cmd (from encoder) + coords (from diffusion)
@@ -106,7 +108,8 @@ def main():
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--font", default=None)
     parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
-    parser.add_argument("--ddim-steps", type=int, default=100)
+    parser.add_argument("--ddim-steps", type=int, default=200)
+    parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
@@ -116,6 +119,7 @@ def main():
         font_path=args.font,
         max_len=args.max_len,
         ddim_steps=args.ddim_steps,
+        guidance_scale=args.guidance_scale,
         device=args.device,
     )
 
