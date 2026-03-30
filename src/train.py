@@ -93,23 +93,22 @@ def train(
             # Content mask from cmd (non-pad positions)
             content_mask = (cmd_indices > 0).float()  # [B, L]
 
-            # Encode condition (full tensor including cmd)
-            cond = encoder(src)
+            # Encode: condition vector + cmd prediction from CLEAN input
+            cond, cmd_logits = encoder(src)
 
             # Forward diffusion on COORDINATES ONLY
             t = torch.randint(0, num_timesteps, (B,), device=device)
             noise = torch.randn_like(coords)
             coords_noisy = scheduler.add_noise(coords, noise, t)
 
-            # Predict
-            pred_noise, cmd_logits = unet(coords_noisy, t, cond)
+            # UNet predicts coord noise only
+            pred_noise = unet(coords_noisy, t, cond)
 
             # Loss 1: MSE on coordinate noise (content only)
             coord_mask = content_mask.unsqueeze(-1)  # [B, L, 1]
             coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
 
-            # Loss 2: Cross-entropy on cmd classification (ALL positions, including PAD)
-            # Model must learn WHEN to stop (predict PAD)
+            # Loss 2: Cross-entropy on cmd from encoder (all positions)
             cmd_loss = F.cross_entropy(
                 cmd_logits.reshape(-1, NUM_CMDS),
                 cmd_indices.reshape(-1),
@@ -149,11 +148,11 @@ def train(
                 cmd_indices = ((cmd_normalized + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
                 content_mask = (cmd_indices > 0).float()
 
-                cond = encoder(src)
+                cond, cmd_logits = encoder(src)
                 t = torch.randint(0, num_timesteps, (B,), device=device)
                 noise = torch.randn_like(coords)
                 coords_noisy = scheduler.add_noise(coords, noise, t)
-                pred_noise, cmd_logits = unet(coords_noisy, t, cond)
+                pred_noise = unet(coords_noisy, t, cond)
 
                 coord_mask = content_mask.unsqueeze(-1)
                 coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)

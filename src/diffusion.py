@@ -64,24 +64,16 @@ class NoiseScheduler:
         cond: torch.Tensor,
         num_steps: int = 100,
         device: str = "cpu",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """DDIM sampling. Returns (coords [B,L,7], cmd_probs [B,L,NUM_CMDS])."""
+    ) -> torch.Tensor:
+        """DDIM sampling. Returns coords [B, L, 7]."""
         B, L, _ = shape_coords
         timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long).tolist()
 
         x = torch.randn(shape_coords, device=device)
-        cmd_logits_accum = None
 
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
-            pred_noise, cmd_logits = model(x, t_tensor, cond)
-
-            # Accumulate cmd predictions (later steps are more reliable)
-            if cmd_logits_accum is None:
-                cmd_logits_accum = cmd_logits
-            else:
-                # Exponential moving average — later predictions weighted more
-                cmd_logits_accum = 0.9 * cmd_logits + 0.1 * cmd_logits_accum
+            pred_noise = model(x, t_tensor, cond)
 
             alpha_t = self.alphas_cumprod[t].to(device)
             x0_pred = (x - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
@@ -94,8 +86,7 @@ class NoiseScheduler:
             else:
                 x = x0_pred
 
-        cmd_probs = F.softmax(cmd_logits_accum, dim=-1)
-        return x, cmd_probs
+        return x
 
 
 # ============================================================
@@ -175,13 +166,13 @@ class Upsample1d(nn.Module):
 
 
 class UNet1d(nn.Module):
-    """1D U-Net for vector path diffusion.
+    """1D U-Net for coordinate-only diffusion.
 
-    Diffusion operates on coordinates only (7 dims).
-    Command types are predicted via classification head (5 classes).
+    Predicts noise on coordinates (7 dims).
+    Cmd prediction is handled by the encoder, not the UNet.
 
     Input:  noisy coords [B, L, 7]
-    Output: (pred_noise [B, L, 7], cmd_logits [B, L, NUM_CMDS])
+    Output: pred_noise [B, L, 7]
     """
 
     def __init__(self, cond_dim: int = 256, model_dim: int = 128, time_dim: int = 128):
@@ -213,18 +204,14 @@ class UNet1d(nn.Module):
         self.up_sample1 = Upsample1d(model_dim)
         self.up1 = ConvBlock1d(model_dim * 2, model_dim, time_dim, cond_dim)
 
-        # Two output heads
-        self.coord_head = nn.Sequential(
+        # Coord-only output head
+        self.output_proj = nn.Sequential(
             nn.GroupNorm(8, model_dim), nn.SiLU(),
             nn.Conv1d(model_dim, COORD_DIM, 1),
         )
-        self.cmd_head = nn.Sequential(
-            nn.GroupNorm(8, model_dim), nn.SiLU(),
-            nn.Conv1d(model_dim, NUM_CMDS, 1),
-        )
 
     def forward(self, x, t, cond):
-        """x: [B, L, 7] noisy coords. Returns (noise_pred [B,L,7], cmd_logits [B,L,5])."""
+        """x: [B, L, 7] noisy coords. Returns pred_noise [B, L, 7]."""
         B, L, _ = x.shape
         t_emb = self.time_embed(t)
 
@@ -248,10 +235,7 @@ class UNet1d(nn.Module):
         u2 = self.up2(torch.cat([u2, h2], dim=1), t_emb, cond)
         u1 = _pad_to_match(self.up_sample1(u2), h1)
         u1 = self.up1(torch.cat([u1, h1], dim=1), t_emb, cond)
-
-        noise_pred = self.coord_head(u1).transpose(1, 2)  # [B, L, 7]
-        cmd_logits = self.cmd_head(u1).transpose(1, 2)     # [B, L, 5]
-        return noise_pred, cmd_logits
+        return self.output_proj(u1).transpose(1, 2)  # [B, L, 7]
 
 
 def _pad_to_match(x, target):

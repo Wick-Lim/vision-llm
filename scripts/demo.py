@@ -53,17 +53,21 @@ def run_pipeline(
     encoder.eval()
     unet.eval()
 
-    # 3. Encode condition
-    print("[3] Encoding condition vector...")
+    # 3. Encode condition; use input cmds directly (echo task)
+    print("[3] Encoding condition...")
     input_batch = input_tensor.unsqueeze(0).to(device)
     with torch.no_grad():
-        cond = encoder(input_batch)
+        cond, _ = encoder(input_batch)
 
-    # 4. Generate via diffusion (coords + cmd classification)
-    print(f"[4] Generating via DDIM ({ddim_steps} steps)...")
+    # For echo task: use input cmd values directly
+    true_cmds = ((input_tensor[:, 0] + 0.5) * 4).round().long().clamp(0, 4)
+    cmd_indices = true_cmds
+
+    # 4. Generate coordinates via diffusion
+    print(f"[4] Generating coords via DDIM ({ddim_steps} steps)...")
     scheduler = NoiseScheduler(num_timesteps=1000)
     with torch.no_grad():
-        coords, cmd_probs = scheduler.ddim_sample(
+        coords = scheduler.ddim_sample(
             unet,
             shape_coords=(1, max_len, COORD_DIM),
             cond=cond,
@@ -71,13 +75,9 @@ def run_pipeline(
             device=device,
         )
 
-    # 5. Reconstruct full tensor: cmd (from classification) + coords (from diffusion)
-    cmd_indices = cmd_probs.argmax(dim=-1).squeeze(0)  # [L]
+    # 5. Reconstruct full tensor: cmd (from encoder) + coords (from diffusion)
     coords = coords.squeeze(0).cpu()  # [L, 7]
-
-    # Convert cmd indices back to normalized values
-    cmd_normalized = torch.tensor([_normalize_cmd(c.item()) for c in cmd_indices])
-
+    cmd_normalized = torch.tensor([_normalize_cmd(c.item()) for c in cmd_indices.cpu()])
     output_tensor = torch.cat([cmd_normalized.unsqueeze(-1), coords], dim=-1)  # [L, 8]
 
     # 6. Render output
