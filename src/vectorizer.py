@@ -25,6 +25,7 @@ NUM_CMDS = 5  # 0..4
 # Tensor column layout: [cmd, x, y, cx1, cy1, cx2, cy2, flag]
 TENSOR_DIM = 8
 DEFAULT_MAX_LEN = 128  # reduced from 512 — most glyphs have <60 commands
+COORD_DIM = TENSOR_DIM - 1  # 7 (x, y, cx1, cy1, cx2, cy2, flag)
 
 
 def _normalize_cmd(cmd: int) -> float:
