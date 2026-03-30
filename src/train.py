@@ -93,24 +93,20 @@ def train(
             # Encode: feature sequence + cmd prediction from CLEAN input
             context, cmd_logits = encoder(src)
 
-            # CFG: 15% of the time, drop condition (replace with zeros)
-            if torch.rand(1).item() < 0.15:
-                context = torch.zeros_like(context)
-
-            # Forward diffusion on COORDINATES ONLY (no noise on padding)
-            t = torch.randint(0, num_timesteps, (B,), device=device)
+            # Forward diffusion (no noise on padding)
+            t = scheduler.sample_timesteps(B, device)  # importance-weighted
             noise = torch.randn_like(coords)
-            coord_mask = content_mask.unsqueeze(-1)  # [B, L, 1]
-            noise = noise * coord_mask  # zero noise on padding positions
+            coord_mask = content_mask.unsqueeze(-1)
+            noise = noise * coord_mask
             coords_noisy = scheduler.add_noise(coords, noise, t)
 
-            # UNet predicts coord noise only
-            pred_noise = unet(coords_noisy, t, context)
+            # UNet predicts x0 directly (not noise)
+            pred_x0 = unet(coords_noisy, t, context)
 
-            # Loss 1: MSE on coordinate noise (content only)
-            coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
+            # Loss 1: MSE on x0 prediction (content only)
+            coord_loss = ((pred_x0 - coords) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
 
-            # Loss 2: Cross-entropy on cmd from encoder (all positions, downweighted)
+            # Loss 2: Cross-entropy on cmd
             cmd_loss = F.cross_entropy(
                 cmd_logits.reshape(-1, NUM_CMDS),
                 cmd_indices.reshape(-1),
@@ -151,14 +147,14 @@ def train(
                 content_mask = (cmd_indices > 0).float()
 
                 context, cmd_logits = encoder(src)
-                t = torch.randint(0, num_timesteps, (B,), device=device)
+                t = scheduler.sample_timesteps(B, device)
                 noise = torch.randn_like(coords)
                 coord_mask = content_mask.unsqueeze(-1)
                 noise = noise * coord_mask
                 coords_noisy = scheduler.add_noise(coords, noise, t)
-                pred_noise = unet(coords_noisy, t, context)
+                pred_x0 = unet(coords_noisy, t, context)
 
-                coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
+                coord_loss = ((pred_x0 - coords) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
                 cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_indices.reshape(-1))
 
                 val_loss += (coord_loss + 0.1 * cmd_loss).item() * B
