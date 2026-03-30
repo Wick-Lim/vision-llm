@@ -49,10 +49,10 @@ class PathDecoder(nn.Module):
             nn.Conv1d(128, 64, 3, padding=1),
             nn.BatchNorm1d(64), nn.ReLU(),
             nn.Conv1d(64, COORD_DIM, 3, padding=1),
-            nn.Tanh(),  # output in [-1, 1], will scale to [-0.5, 0.5]
+            # No Tanh — let the network learn the full range
         )
 
     def forward(self, z):
         """z: [B, L/2, latent_dim] → coords [B, L, COORD_DIM]"""
         out = self.deconv(z.transpose(1, 2))  # [B, COORD_DIM, L]
-        return out.transpose(1, 2) * 0.5  # scale to [-0.5, 0.5]
+        return out.transpose(1, 2).clamp(-0.5, 0.5)

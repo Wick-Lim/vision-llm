@@ -1,8 +1,10 @@
-"""Latent diffusion training: diffuse in encoder's latent space, decode to coords."""
+"""2-phase latent diffusion training.
 
-import argparse
-import copy
-import time
+Phase 1: Encoder-Decoder pretraining (no diffusion)
+Phase 2: Latent diffusion with frozen encoder
+"""
+
+import argparse, copy, time
 from pathlib import Path
 
 import torch
@@ -17,9 +19,9 @@ from .vectorizer import DEFAULT_MAX_LEN, NUM_CMDS
 
 
 def train(
-    font_path=None, max_len=DEFAULT_MAX_LEN, epochs=100, batch_size=32,
+    font_path=None, max_len=DEFAULT_MAX_LEN, epochs=5000, batch_size=32,
     lr=1e-3, device=None, save_dir="checkpoints", num_timesteps=1000,
-    latent_dim=256, model_dim=256, max_chars=None,
+    latent_dim=256, model_dim=128, max_chars=None,
 ):
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,138 +35,159 @@ def train(
     unet = LatentUNet1d(latent_dim=latent_dim, model_dim=model_dim).to(device)
     scheduler = NoiseScheduler(num_timesteps=num_timesteps)
 
-    # EMA
-    ema_enc = copy.deepcopy(encoder)
-    ema_dec = copy.deepcopy(decoder)
-    ema_unet = copy.deepcopy(unet)
-
-    all_params = list(encoder.parameters()) + list(decoder.parameters()) + list(unet.parameters())
-    total = sum(p.numel() for p in all_params)
-    print(f"Params: enc={sum(p.numel() for p in encoder.parameters()):,} "
-          f"dec={sum(p.numel() for p in decoder.parameters()):,} "
-          f"unet={sum(p.numel() for p in unet.parameters()):,} total={total:,}")
-
-    optimizer = torch.optim.AdamW(all_params, lr=lr)
-    lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
     save_path = Path(save_dir)
     save_path.mkdir(exist_ok=True)
-    best_val = float("inf")
 
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
+    phase1_epochs = epochs * 2 // 5  # 40% for autoencoder
+    phase2_epochs = epochs - phase1_epochs
 
-        # --- Phase 1: Train encoder-decoder reconstruction (first 20% of epochs) ---
-        # --- Phase 2: Train latent diffusion (remaining 80%) ---
-        warmup = epoch <= max(1, epochs // 5)
+    # ===== Phase 1: Encoder-Decoder pretraining =====
+    print(f"\n=== Phase 1: Encoder-Decoder ({phase1_epochs} epochs) ===")
+    opt1 = torch.optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()), lr=lr)
+    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=phase1_epochs)
+    best_recon = float("inf")
 
-        encoder.train(); decoder.train(); unet.train()
+    for epoch in range(1, phase1_epochs + 1):
+        encoder.train(); decoder.train()
         train_loss = 0.0; n = 0
-
         for src, tgt in dl:
             src, tgt = src.to(device), tgt.to(device)
             B = src.size(0)
-            cmd_norm = tgt[:, :, 0]
             coords = tgt[:, :, 1:]
-            cmd_idx = ((cmd_norm + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
-            content_mask = (cmd_idx > 0).float().unsqueeze(-1)
+            cmd_idx = ((tgt[:, :, 0] + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
+            mask = (cmd_idx > 0).float().unsqueeze(-1)
 
-            # Encode
-            z, cmd_logits = encoder(src)  # z: [B, S, 256]
+            z, cmd_logits = encoder(src)
+            pred_coords = decoder(z)
 
-            if warmup:
-                # Phase 1: just train encoder-decoder reconstruction
-                pred_coords = decoder(z)
-                recon_loss = ((pred_coords - coords) ** 2 * content_mask).sum() / content_mask.sum().clamp(min=1)
-                cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_idx.reshape(-1))
-                loss = recon_loss + 0.1 * cmd_loss
-            else:
-                # Phase 2: latent diffusion
-                t = scheduler.sample_timesteps(B, device)
-                noise = torch.randn_like(z)
-                z_noisy = scheduler.add_noise(z.detach(), noise, t)  # detach encoder for stable diffusion
+            recon = ((pred_coords - coords) ** 2 * mask).sum() / mask.sum().clamp(min=1)
+            cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_idx.reshape(-1))
+            loss = recon + 0.1 * cmd_loss
 
-                z_pred = unet(z_noisy, t, z.detach())  # condition on clean latent
+            opt1.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()), 1.0)
+            opt1.step()
+            train_loss += loss.item() * B; n += B
 
-                # Latent MSE loss
-                latent_loss = F.mse_loss(z_pred, z.detach())
-
-                # Also train decoder on predicted latent
-                pred_coords = decoder(z_pred)
-                recon_loss = ((pred_coords - coords) ** 2 * content_mask).sum() / content_mask.sum().clamp(min=1)
-
-                cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_idx.reshape(-1))
-                loss = latent_loss + recon_loss + 0.1 * cmd_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            optimizer.step()
-
-            ema_update(ema_enc, encoder)
-            ema_update(ema_dec, decoder)
-            ema_update(ema_unet, unet)
-
-            train_loss += loss.item() * B
-            n += B
-
-        train_loss /= n
-
-        # --- Validate ---
-        encoder.eval(); decoder.eval(); unet.eval()
+        # Val
+        encoder.eval(); decoder.eval()
         val_loss = 0.0; nv = 0
         with torch.no_grad():
             for src, tgt in dl:
                 src, tgt = src.to(device), tgt.to(device)
-                B = src.size(0)
                 coords = tgt[:, :, 1:]
                 cmd_idx = ((tgt[:, :, 0] + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
-                content_mask = (cmd_idx > 0).float().unsqueeze(-1)
+                mask = (cmd_idx > 0).float().unsqueeze(-1)
+                z, _ = encoder(src)
+                pred = decoder(z)
+                val_loss += ((pred - coords) ** 2 * mask).sum().item() / mask.sum().clamp(min=1).item()
+                nv += 1
+        val_loss /= nv
+        sched1.step()
+
+        if epoch % 100 == 0 or epoch == 1:
+            print(f"[{epoch:5d}/{phase1_epochs}] recon train={train_loss/n:.6f} val={val_loss:.6f}")
+        if val_loss < best_recon:
+            best_recon = val_loss
+
+    print(f"Phase 1 done. Best recon: {best_recon:.6f}")
+
+    # ===== Phase 2: Latent Diffusion (encoder frozen) =====
+    print(f"\n=== Phase 2: Latent Diffusion ({phase2_epochs} epochs) ===")
+    encoder.eval()
+    for p in encoder.parameters(): p.requires_grad_(False)
+    for p in decoder.parameters(): p.requires_grad_(False)
+
+    # Compute latent stats for normalization
+    with torch.no_grad():
+        all_z = []
+        for src, _ in dl:
+            z, _ = encoder(src.to(device))
+            all_z.append(z)
+        all_z = torch.cat(all_z, 0)
+        z_mean = all_z.mean()
+        z_std = all_z.std()
+        print(f"Latent stats: mean={z_mean:.4f}, std={z_std:.4f}")
+
+    ema_unet = copy.deepcopy(unet)
+    opt2 = torch.optim.AdamW(unet.parameters(), lr=lr * 0.3)
+    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=phase2_epochs)
+    best_diff = float("inf")
+
+    for epoch in range(1, phase2_epochs + 1):
+        unet.train()
+        train_loss = 0.0; n = 0
+        for src, tgt in dl:
+            src, tgt = src.to(device), tgt.to(device)
+            B = src.size(0)
+
+            with torch.no_grad():
+                z, _ = encoder(src)
+                z_norm = (z - z_mean) / z_std  # normalize to ~N(0,1)
+
+            t = scheduler.sample_timesteps(B, device)
+            noise = torch.randn_like(z_norm)
+            z_noisy = scheduler.add_noise(z_norm, noise, t)
+
+            z_pred = unet(z_noisy, t, z_norm)  # condition on clean normalized latent
+            loss = F.mse_loss(z_pred, z_norm)
+
+            opt2.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
+            opt2.step()
+            ema_update(ema_unet, unet)
+            train_loss += loss.item() * B; n += B
+
+        # Val: full pipeline
+        unet.eval()
+        val_loss = 0.0; nv = 0
+        with torch.no_grad():
+            for src, tgt in dl:
+                src, tgt = src.to(device), tgt.to(device)
+                coords = tgt[:, :, 1:]
+                cmd_idx = ((tgt[:, :, 0] + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
+                mask = (cmd_idx > 0).float().unsqueeze(-1)
 
                 z, _ = encoder(src)
-                if warmup:
-                    pred_coords = decoder(z)
-                else:
-                    # Full pipeline: encode → add noise → denoise → decode
-                    t = scheduler.sample_timesteps(B, device)
-                    noise = torch.randn_like(z)
-                    z_noisy = scheduler.add_noise(z, noise, t)
-                    z_pred = unet(z_noisy, t, z)
-                    pred_coords = decoder(z_pred)
+                z_norm = (z - z_mean) / z_std
 
-                mse = ((pred_coords - coords) ** 2 * content_mask).sum() / content_mask.sum().clamp(min=1)
-                val_loss += mse.item() * B
-                nv += B
+                # DDIM sample
+                z_gen = scheduler.ddim_sample(ema_unet, z_norm.shape, z_norm, num_steps=50, device=device)
+                z_gen_denorm = z_gen * z_std + z_mean
+                pred_coords = decoder(z_gen_denorm)
+
+                mse = ((pred_coords - coords) ** 2 * mask).sum() / mask.sum().clamp(min=1)
+                val_loss += mse.item(); nv += 1
         val_loss /= nv
-        lr_sched.step()
+        sched2.step()
 
-        elapsed = time.time() - t0
-        phase = "warmup" if warmup else "diffusion"
-        print(f"[{epoch:5d}/{epochs}] {phase} train={train_loss:.6f} val={val_loss:.6f} ({elapsed:.1f}s)")
-
-        if val_loss < best_val:
-            best_val = val_loss
+        if epoch % 100 == 0 or epoch == 1:
+            print(f"[{epoch:5d}/{phase2_epochs}] diffusion train={train_loss/n:.6f} val(coord)={val_loss:.6f}")
+        if val_loss < best_diff:
+            best_diff = val_loss
             torch.save({
-                "encoder": ema_enc.state_dict(),
-                "decoder": ema_dec.state_dict(),
+                "encoder": encoder.state_dict(),
+                "decoder": decoder.state_dict(),
                 "unet": ema_unet.state_dict(),
+                "z_mean": z_mean, "z_std": z_std,
                 "epoch": epoch, "val_loss": val_loss,
             }, save_path / "best.pt")
 
     torch.save({
-        "encoder": ema_enc.state_dict(),
-        "decoder": ema_dec.state_dict(),
+        "encoder": encoder.state_dict(),
+        "decoder": decoder.state_dict(),
         "unet": ema_unet.state_dict(),
-        "epoch": epochs, "val_loss": val_loss,
+        "z_mean": z_mean, "z_std": z_std,
+        "epoch": phase1_epochs + phase2_epochs, "val_loss": val_loss,
     }, save_path / "last.pt")
-    print(f"Done. Best val loss: {best_val:.6f}")
+    print(f"\nDone. Best recon: {best_recon:.6f}, Best diffusion: {best_diff:.6f}")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--font", default=None)
     p.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", default=None)
