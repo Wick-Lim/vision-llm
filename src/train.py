@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from .dataset import GlyphEchoDataset, collate_glyph_batch
 from .diffusion import COORD_DIM, NoiseScheduler, UNet1d, ema_update
@@ -38,14 +38,11 @@ def train(
 
     print(f"Device: {device}")
 
-    # Dataset
+    # Dataset — echo task: same data for train and val (different noise levels)
     dataset = GlyphEchoDataset(font_path=font_path, max_len=max_len, max_chars=max_chars)
-    val_size = max(1, len(dataset) // 5)  # 20% val
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_glyph_batch)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, num_workers=0, collate_fn=collate_glyph_batch)
+    train_dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_glyph_batch)
+    val_dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_glyph_batch)
 
     # Models
     encoder = PathEncoder(feat_dim=cond_dim).to(device)
