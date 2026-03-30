@@ -99,19 +99,18 @@ class Upsample1d(nn.Module):
 
 
 class LatentUNet1d(nn.Module):
-    """1D U-Net for latent diffusion.
+    """1D U-Net for latent diffusion with additive skip conditioning.
 
-    Operates in latent space [B, S, latent_dim].
-    Conditioning: concatenate clean latent with noisy latent as input.
-    No cross-attention needed.
+    UNet predicts RESIDUAL. Output = z_cond + residual.
+    At t=0 (echo): residual=0 → output=z_cond (trivially correct).
     """
 
     def __init__(self, latent_dim=256, model_dim=256, time_dim=128):
         super().__init__()
         D = model_dim
         self.time_embed = TimeMLPEmbedding(time_dim)
-        # Input: noisy_latent + cond_latent concatenated → 2 * latent_dim
-        self.input_proj = nn.Conv1d(latent_dim * 2, D, 1)
+        # Input: noisy_latent only (no concat bottleneck)
+        self.input_proj = nn.Conv1d(latent_dim, D, 1)
 
         self.down1 = ConvBlock1d(D, D, time_dim)
         self.down_sample1 = Downsample1d(D)
@@ -132,11 +131,10 @@ class LatentUNet1d(nn.Module):
         )
 
     def forward(self, z_noisy, t, z_cond):
-        """z_noisy: [B,S,D], t: [B], z_cond: [B,S,D]. Returns x0_pred [B,S,D]."""
+        """z_noisy: [B,S,D], t: [B], z_cond: [B,S,D]. Returns x0_pred = z_cond + residual."""
         te = self.time_embed(t)
-        # Concatenate noisy + condition latents
-        x = torch.cat([z_noisy, z_cond], dim=-1).transpose(1, 2)  # [B, 2D, S]
-        x = self.input_proj(x)  # [B, model_dim, S]
+        # Input: noisy latent only (no concat)
+        x = self.input_proj(z_noisy.transpose(1, 2))  # [B, model_dim, S]
 
         h1 = self.down1(x, te)
         h1d = self.down_sample1(h1)
@@ -152,7 +150,9 @@ class LatentUNet1d(nn.Module):
         u1 = _p(self.up_sample1(u2), h1)
         u1 = self.up1(torch.cat([u1, h1], 1), te)
 
-        return self.output_proj(u1).transpose(1, 2)
+        # Additive skip: output = z_cond + learned residual
+        residual = self.output_proj(u1).transpose(1, 2)  # [B, S, latent_dim]
+        return z_cond + residual
 
 
 def _p(x, t):

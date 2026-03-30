@@ -46,7 +46,7 @@ def train_gpu(
         max_chars=max_chars,
         device="cuda",
         save_dir="/root/checkpoints",
-        model_dim=128,
+        model_dim=256,
     )
 
     volume.commit()

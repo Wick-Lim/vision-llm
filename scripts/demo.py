@@ -27,7 +27,7 @@ def run_pipeline(text, checkpoint, font_path=None, max_len=DEFAULT_MAX_LEN,
     print(f"[2] Loading from {checkpoint}...")
     enc = PathEncoder(latent_dim=256).to(device)
     dec = PathDecoder(latent_dim=256).to(device)
-    unet = LatentUNet1d(latent_dim=256, model_dim=128).to(device)
+    unet = LatentUNet1d(latent_dim=256, model_dim=256).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     enc.load_state_dict(ckpt["encoder"])
     dec.load_state_dict(ckpt["decoder"])
