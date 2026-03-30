@@ -96,25 +96,26 @@ def train(
             # Encode: condition vector + cmd prediction from CLEAN input
             cond, cmd_logits = encoder(src)
 
-            # Forward diffusion on COORDINATES ONLY
+            # Forward diffusion on COORDINATES ONLY (no noise on padding)
             t = torch.randint(0, num_timesteps, (B,), device=device)
             noise = torch.randn_like(coords)
+            coord_mask = content_mask.unsqueeze(-1)  # [B, L, 1]
+            noise = noise * coord_mask  # zero noise on padding positions
             coords_noisy = scheduler.add_noise(coords, noise, t)
 
             # UNet predicts coord noise only
             pred_noise = unet(coords_noisy, t, cond)
 
             # Loss 1: MSE on coordinate noise (content only)
-            coord_mask = content_mask.unsqueeze(-1)  # [B, L, 1]
             coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
 
-            # Loss 2: Cross-entropy on cmd from encoder (all positions)
+            # Loss 2: Cross-entropy on cmd from encoder (all positions, downweighted)
             cmd_loss = F.cross_entropy(
                 cmd_logits.reshape(-1, NUM_CMDS),
                 cmd_indices.reshape(-1),
             )
 
-            loss = coord_loss + cmd_loss
+            loss = coord_loss + 0.1 * cmd_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -151,14 +152,15 @@ def train(
                 cond, cmd_logits = encoder(src)
                 t = torch.randint(0, num_timesteps, (B,), device=device)
                 noise = torch.randn_like(coords)
+                coord_mask = content_mask.unsqueeze(-1)
+                noise = noise * coord_mask
                 coords_noisy = scheduler.add_noise(coords, noise, t)
                 pred_noise = unet(coords_noisy, t, cond)
 
-                coord_mask = content_mask.unsqueeze(-1)
                 coord_loss = ((pred_noise - noise) ** 2 * coord_mask).sum() / coord_mask.sum().clamp(min=1)
                 cmd_loss = F.cross_entropy(cmd_logits.reshape(-1, NUM_CMDS), cmd_indices.reshape(-1))
 
-                val_loss += (coord_loss + cmd_loss).item() * B
+                val_loss += (coord_loss + 0.1 * cmd_loss).item() * B
                 n_val += B
 
         val_loss /= n_val

@@ -130,11 +130,16 @@ class ConvBlock1d(nn.Module):
             nn.SiLU(),
         )
         self.time_proj = nn.Linear(time_dim, out_ch)
-        self.cond_proj = nn.Linear(cond_dim, out_ch)
+        # Position-dependent conditioning: expand + conv for per-position signal
+        self.cond_fc = nn.Linear(cond_dim, out_ch)
+        self.cond_conv = nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1)
         self.res_conv = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x, t_emb, cond_emb):
-        h = self.conv(x) + self.time_proj(t_emb).unsqueeze(-1) + self.cond_proj(cond_emb).unsqueeze(-1)
+        # Expand condition to sequence length, then conv for position-specific signal
+        cond_signal = self.cond_fc(cond_emb).unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        cond_signal = self.cond_conv(cond_signal)  # [B, out_ch, L] — different per position
+        h = self.conv(x) + self.time_proj(t_emb).unsqueeze(-1) + cond_signal
         return h + self.res_conv(x)
 
 
