@@ -103,7 +103,7 @@ def train(
         all_z = []
         for src, _ in dl:
             z, _ = encoder(src.to(device))
-            all_z.append(z)
+            all_z.append(z.reshape(-1, z.shape[-1]))  # [B*L/2, latent_dim]
         all_z = torch.cat(all_z, 0)
         z_mean = all_z.mean()
         z_std = all_z.std()
@@ -171,6 +171,7 @@ def train(
                 "unet": ema_unet.state_dict(),
                 "z_mean": z_mean, "z_std": z_std,
                 "epoch": epoch, "val_loss": val_loss,
+                "latent_dim": latent_dim, "model_dim": model_dim,
             }, save_path / "best.pt")
 
     torch.save({
@@ -179,6 +180,7 @@ def train(
         "unet": ema_unet.state_dict(),
         "z_mean": z_mean, "z_std": z_std,
         "epoch": phase1_epochs + phase2_epochs, "val_loss": val_loss,
+        "latent_dim": latent_dim, "model_dim": model_dim,
     }, save_path / "last.pt")
     print(f"\nDone. Best recon: {best_recon:.6f}, Best diffusion: {best_diff:.6f}")
 
