@@ -1,7 +1,7 @@
-"""Dataset for vector path diffusion training.
+"""Datasets for vector path diffusion training.
 
-Phase 1: Echo task — reproduce the same glyph's vector paths.
-Uses Korean Hangul syllables (가~힣) + ASCII printable characters.
+GlyphEchoDataset: input = target (Phase 1 validation)
+GlyphPairDataset: input ≠ target (Phase 2 generation)
 """
 
 import torch
@@ -10,125 +10,123 @@ from fontTools.ttLib import TTFont
 from torch.utils.data import Dataset
 
 from .vectorizer import (
-    DEFAULT_MAX_LEN,
-    _normalize_cmd,
-    CMD_PAD,
-    TENSOR_DIM,
-    extract_glyph,
-    get_glyph_bounds,
-    load_font,
-    paths_to_tensor,
+    DEFAULT_MAX_LEN, _normalize_cmd, CMD_PAD, TENSOR_DIM,
+    extract_glyph, get_glyph_bounds, load_font, paths_to_tensor,
+    extract_text,
 )
 
-# Hangul syllable range
 HANGUL_START = 0xAC00
-HANGUL_END = 0xD7A3  # 11,172 syllables
-
-# ASCII printable range
-ASCII_START = 0x21
-ASCII_END = 0x7E  # 94 characters
-
-# Minimum tensor length (must be divisible by 8 for U-Net downsampling)
+HANGUL_END = 0xD7A3
 MIN_LEN = 64
 
 
-def _chars_in_font(font: TTFont, chars: list[str]) -> list[str]:
-    """Filter characters that exist in the font's cmap."""
+def _chars_in_font(font, chars):
     cmap = font.getBestCmap()
     return [c for c in chars if ord(c) in cmap]
 
 
-def _trim_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Trim tensor to actual content length + margin, aligned to 8."""
+def _trim_tensor(tensor):
     pad_val = _normalize_cmd(CMD_PAD)
-    content_mask = tensor[:, 0] > pad_val + 0.1
-    if not content_mask.any():
+    mask = tensor[:, 0] > pad_val + 0.1
+    if not mask.any():
         return tensor[:MIN_LEN]
-    last_content = content_mask.nonzero()[-1].item()
-    # Round up to next multiple of 8, with minimum MIN_LEN
-    trim_len = max(MIN_LEN, ((last_content + 8) // 8) * 8)
+    last = mask.nonzero()[-1].item()
+    trim_len = max(MIN_LEN, ((last + 8) // 8) * 8)
     return tensor[:trim_len]
 
 
-def collate_glyph_batch(batch: list[tuple[torch.Tensor, torch.Tensor]]):
-    """Custom collate: pad tensors to max length in batch."""
-    srcs, tgts = zip(*batch)
-    max_len = max(s.shape[0] for s in srcs)
-    # Round up to multiple of 8
-    max_len = ((max_len + 7) // 8) * 8
+def _extract_tensor(font, char, max_len):
+    paths = extract_glyph(font, char)
+    bounds = get_glyph_bounds(font, char)
+    tensor = paths_to_tensor(paths, max_len=max_len, bounds=bounds)
+    if not (tensor[:, 0] > -0.4).any():
+        return None
+    return _trim_tensor(tensor)
 
+
+def collate_glyph_batch(batch):
+    srcs, tgts = zip(*batch)
+    max_src = max(s.shape[0] for s in srcs)
+    max_tgt = max(t.shape[0] for t in tgts)
+    max_len = max(max_src, max_tgt)
+    max_len = ((max_len + 7) // 8) * 8
     pad_val = _normalize_cmd(CMD_PAD)
 
-    padded_srcs = []
-    padded_tgts = []
-    for s, t in zip(srcs, tgts):
-        pad_rows = max_len - s.shape[0]
-        if pad_rows > 0:
-            pad = torch.full((pad_rows, TENSOR_DIM), pad_val)
-            s = torch.cat([s, pad], dim=0)
-            t = torch.cat([t, pad], dim=0)
-        padded_srcs.append(s)
-        padded_tgts.append(t)
+    def pad_to(t, length):
+        if t.shape[0] < length:
+            return torch.cat([t, torch.full((length - t.shape[0], TENSOR_DIM), pad_val)])
+        return t
 
-    return torch.stack(padded_srcs), torch.stack(padded_tgts)
+    return (
+        torch.stack([pad_to(s, max_len) for s in srcs]),
+        torch.stack([pad_to(t, max_len) for t in tgts]),
+    )
 
 
 class GlyphEchoDataset(Dataset):
-    """Echo task: input = target = same glyph's vector path tensor.
+    """Echo: input = target."""
 
-    Uses adaptive trimming to reduce padding ratio.
-    """
-
-    def __init__(
-        self,
-        font_path: str | None = None,
-        max_len: int = DEFAULT_MAX_LEN,
-        hangul: bool = True,
-        ascii_chars: bool = True,
-        max_chars: int | None = None,
-    ):
+    def __init__(self, font_path=None, max_len=DEFAULT_MAX_LEN, max_chars=None, **kw):
         self.font = load_font(font_path)
-        self.max_len = max_len
-
-        chars = []
-        if hangul:
-            chars.extend(chr(cp) for cp in range(HANGUL_START, HANGUL_END + 1))
-        if ascii_chars:
-            chars.extend(chr(cp) for cp in range(ASCII_START, ASCII_END + 1))
-
-        if max_chars is not None and len(chars) > max_chars:
-            import random
-            random.Random(42).shuffle(chars)
-            chars = chars[:max_chars]
-
+        chars = [chr(cp) for cp in range(HANGUL_START, HANGUL_END + 1)]
+        if max_chars and len(chars) > max_chars:
+            import random; random.Random(42).shuffle(chars); chars = chars[:max_chars]
         self.chars = _chars_in_font(self.font, chars)
-        print(f"GlyphEchoDataset: {len(self.chars)} glyphs available")
-
-        # Pre-extract and trim tensors
-        self.tensors: list[torch.Tensor] = []
-        skipped = 0
-        for char in self.chars:
+        self.tensors = []
+        for c in self.chars:
             try:
-                paths = extract_glyph(self.font, char)
-                bounds = get_glyph_bounds(self.font, char)
-                tensor = paths_to_tensor(paths, max_len=max_len, bounds=bounds)
-                has_content = (tensor[:, 0] > -0.4).any()
-                if has_content:
-                    self.tensors.append(_trim_tensor(tensor))
-                else:
-                    skipped += 1
-            except Exception as e:
+                t = _extract_tensor(self.font, c, max_len)
+                if t is not None: self.tensors.append(t)
+            except: pass
+        print(f"GlyphEchoDataset: {len(self.tensors)} glyphs")
+
+    def __len__(self): return len(self.tensors)
+    def __getitem__(self, idx): return self.tensors[idx], self.tensors[idx]
+
+
+class GlyphPairDataset(Dataset):
+    """Glyph pair: input → different target. For generation training."""
+
+    def __init__(self, font_path=None, max_len=DEFAULT_MAX_LEN, max_pairs=None):
+        self.font = load_font(font_path)
+        # Create sequential pairs: 가→나, 나→다, 다→라, ...
+        chars = _chars_in_font(self.font, [chr(cp) for cp in range(HANGUL_START, HANGUL_START + 200)])
+
+        self.pairs = []  # (src_tensor, tgt_tensor)
+        skipped = 0
+        for i in range(len(chars) - 1):
+            try:
+                src = _extract_tensor(self.font, chars[i], max_len)
+                tgt = _extract_tensor(self.font, chars[i + 1], max_len)
+                if src is not None and tgt is not None:
+                    self.pairs.append((src, tgt))
+            except:
                 skipped += 1
-                print(f"  Warning: failed to extract '{char}': {e}")
 
-        if skipped:
-            print(f"  Skipped {skipped} glyphs")
-        avg_len = sum(t.shape[0] for t in self.tensors) / max(len(self.tensors), 1)
-        print(f"  Final: {len(self.tensors)} glyphs, avg trimmed len={avg_len:.0f}")
+        if max_pairs and len(self.pairs) > max_pairs:
+            self.pairs = self.pairs[:max_pairs]
 
-    def __len__(self) -> int:
-        return len(self.tensors)
+        print(f"GlyphPairDataset: {len(self.pairs)} pairs (skipped {skipped})")
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        t = self.tensors[idx]
-        return t, t
+    def __len__(self): return len(self.pairs)
+    def __getitem__(self, idx): return self.pairs[idx]
+
+
+class TextPairDataset(Dataset):
+    """Text Q&A pairs rendered as vector paths."""
+
+    def __init__(self, pairs: list[tuple[str, str]], font_path=None, max_len=DEFAULT_MAX_LEN):
+        self.font = load_font(font_path)
+        self.data = []
+        for q, a in pairs:
+            try:
+                src = _trim_tensor(extract_text(self.font, q, max_len=max_len))
+                tgt = _trim_tensor(extract_text(self.font, a, max_len=max_len))
+                if (src[:, 0] > -0.4).any() and (tgt[:, 0] > -0.4).any():
+                    self.data.append((src, tgt))
+            except:
+                pass
+        print(f"TextPairDataset: {len(self.data)} pairs from {len(pairs)} input")
+
+    def __len__(self): return len(self.data)
+    def __getitem__(self, idx): return self.data[idx]

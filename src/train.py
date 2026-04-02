@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .dataset import GlyphEchoDataset, collate_glyph_batch
+from .dataset import GlyphEchoDataset, GlyphPairDataset, collate_glyph_batch
 from .diffusion import LatentUNet1d, NoiseScheduler, ema_update
 from .encoder import PathEncoder, PathDecoder
 from .vectorizer import DEFAULT_MAX_LEN, NUM_CMDS
@@ -21,13 +21,16 @@ from .vectorizer import DEFAULT_MAX_LEN, NUM_CMDS
 def train(
     font_path=None, max_len=DEFAULT_MAX_LEN, epochs=5000, batch_size=32,
     lr=1e-3, device=None, save_dir="checkpoints", num_timesteps=1000,
-    latent_dim=256, model_dim=128, max_chars=None,
+    latent_dim=256, model_dim=256, max_chars=None, mode="echo",
 ):
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    print(f"Device: {device} | Mode: {mode}")
 
-    dataset = GlyphEchoDataset(font_path=font_path, max_len=max_len, max_chars=max_chars)
+    if mode == "pair":
+        dataset = GlyphPairDataset(font_path=font_path, max_len=max_len, max_pairs=max_chars)
+    else:
+        dataset = GlyphEchoDataset(font_path=font_path, max_len=max_len, max_chars=max_chars)
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_glyph_batch)
 
     encoder = PathEncoder(latent_dim=latent_dim).to(device)
@@ -98,12 +101,13 @@ def train(
     for p in encoder.parameters(): p.requires_grad_(False)
     for p in decoder.parameters(): p.requires_grad_(False)
 
-    # Compute latent stats for normalization
+    # Compute latent stats for normalization (from both src and tgt)
     with torch.no_grad():
         all_z = []
-        for src, _ in dl:
-            z, _ = encoder(src.to(device))
-            all_z.append(z.reshape(-1, z.shape[-1]))  # [B*L/2, latent_dim]
+        for src, tgt in dl:
+            z_src, _ = encoder(src.to(device))
+            z_tgt, _ = encoder(tgt.to(device))
+            all_z.extend([z_src, z_tgt])
         all_z = torch.cat(all_z, 0)
         z_mean = all_z.mean()
         z_std = all_z.std()
@@ -122,15 +126,18 @@ def train(
             B = src.size(0)
 
             with torch.no_grad():
-                z, _ = encoder(src)
-                z_norm = (z - z_mean) / z_std  # normalize to ~N(0,1)
+                z_src, _ = encoder(src)  # condition
+                z_tgt, _ = encoder(tgt)  # target to generate
+                z_src_norm = (z_src - z_mean) / z_std
+                z_tgt_norm = (z_tgt - z_mean) / z_std
 
             t = scheduler.sample_timesteps(B, device)
-            noise = torch.randn_like(z_norm)
-            z_noisy = scheduler.add_noise(z_norm, noise, t)
+            noise = torch.randn_like(z_tgt_norm)
+            z_noisy = scheduler.add_noise(z_tgt_norm, noise, t)
 
-            z_pred = unet(z_noisy, t, z_norm)  # condition on clean normalized latent
-            loss = F.mse_loss(z_pred, z_norm)
+            # Condition on SRC latent, predict TGT latent
+            z_pred = unet(z_noisy, t, z_src_norm)
+            loss = F.mse_loss(z_pred, z_tgt_norm)
 
             opt2.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
@@ -148,11 +155,11 @@ def train(
                 cmd_idx = ((tgt[:, :, 0] + 0.5) * (NUM_CMDS - 1)).round().long().clamp(0, NUM_CMDS - 1)
                 mask = (cmd_idx > 0).float().unsqueeze(-1)
 
-                z, _ = encoder(src)
-                z_norm = (z - z_mean) / z_std
+                z_src, _ = encoder(src)
+                z_src_norm = (z_src - z_mean) / z_std
 
-                # DDIM sample
-                z_gen = scheduler.ddim_sample(ema_unet, z_norm.shape, z_norm, num_steps=50, device=device)
+                # DDIM: generate tgt latent conditioned on src latent
+                z_gen = scheduler.ddim_sample(ema_unet, z_src_norm.shape, z_src_norm, num_steps=50, device=device)
                 z_gen_denorm = z_gen * z_std + z_mean
                 pred_coords = decoder(z_gen_denorm)
 
@@ -195,9 +202,10 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--max-chars", type=int, default=None)
+    p.add_argument("--mode", choices=["echo", "pair"], default="echo")
     a = p.parse_args()
     train(font_path=a.font, max_len=a.max_len, epochs=a.epochs, batch_size=a.batch_size,
-          lr=a.lr, device=a.device, max_chars=a.max_chars, num_timesteps=a.timesteps)
+          lr=a.lr, device=a.device, max_chars=a.max_chars, num_timesteps=a.timesteps, mode=a.mode)
 
 if __name__ == "__main__":
     main()

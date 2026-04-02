@@ -47,6 +47,7 @@ def train_gpu(
         device="cuda",
         save_dir="/root/checkpoints",
         model_dim=256,
+        mode="pair",
     )
 
     volume.commit()
